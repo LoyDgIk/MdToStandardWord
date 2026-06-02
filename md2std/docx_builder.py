@@ -11,13 +11,16 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import copy
 import os
 import re
 import shutil
+import zipfile
 from typing import List, Optional
 
 from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
@@ -65,6 +68,125 @@ def _set_numbering(para: Paragraph, num_id: int, ilvl: int):
         ppr.insert(0, numpr)
 
 
+def _first_existing_path(candidates: List[str], label: str) -> str:
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    raise FileNotFoundError("找不到%s：%s" % (label, "；".join(candidates)))
+
+
+def _resolve_kind(kind: str, meta: model.Meta) -> str:
+    if kind not in ("auto", "group", "national"):
+        raise ValueError("kind 只能是 auto、group 或 national。")
+    if kind != "auto":
+        return kind
+    standard_type = (meta.standard_type or "").strip()
+    number = (meta.number or "").strip().upper()
+    if "国家" in standard_type or number.startswith("GB"):
+        return "national"
+    return "group"
+
+
+def _default_cover_path(kind: str) -> str:
+    if kind == "national":
+        return _first_existing_path([
+            os.path.join(_PROJ_DIR, "templates", "cover_national.docx"),
+            os.path.join(_PROJ_DIR, "国家标准.docx"),
+        ], "国家标准封面蓝图")
+    return _first_existing_path([
+        os.path.join(_PROJ_DIR, "templates", "cover_group.docx"),
+        os.path.join(_PROJ_DIR, "2 团体标准——模板.docx"),
+        os.path.join(_PROJ_DIR, "templates", "团体标准模板.docx"),
+    ], "团体标准封面蓝图")
+
+
+def _cover_blueprint_from_source(source_path: str, output_path: str):
+    """从完整模板截取封面页为蓝图，保留原封面的图片、关系和首个分节符。"""
+    from lxml import etree
+
+    w_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    ns = {"w": w_ns}
+    with zipfile.ZipFile(source_path, "r") as zin, zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "word/document.xml":
+                root = etree.fromstring(data)
+                body = root.find("w:body", namespaces=ns)
+                children = list(body)
+                final_sect = None
+                for child in children:
+                    if child.tag == "{%s}sectPr" % w_ns:
+                        final_sect = child
+                        break
+
+                keep = []
+                for child in children:
+                    if child.tag == "{%s}sectPr" % w_ns:
+                        continue
+                    keep.append(child)
+                    if child.tag == "{%s}p" % w_ns and child.find("w:pPr/w:sectPr", namespaces=ns) is not None:
+                        break
+
+                for child in list(body):
+                    body.remove(child)
+                for child in keep:
+                    body.append(child)
+                if final_sect is not None:
+                    body.append(final_sect)
+                data = etree.tostring(
+                    root,
+                    xml_declaration=True,
+                    encoding="UTF-8",
+                    standalone=True,
+                )
+            zout.writestr(item, data)
+
+
+def _copy_cover_base(cover_path: str, output_path: str):
+    """复制封面蓝图；若传入完整模板，则运行时截取封面，不带入正文占位章。"""
+    # 正式蓝图文件名固定为 cover_*.docx。其它 docx 来源按完整模板处理并截取首节。
+    name = os.path.basename(cover_path).lower()
+    if name.startswith("cover_"):
+        shutil.copyfile(cover_path, output_path)
+    else:
+        _cover_blueprint_from_source(cover_path, output_path)
+
+
+def _read_cover_end_line_image(docx_path: str, kind: str) -> bytes:
+    """读取封面蓝图包内自带的标准结束线图片。"""
+    if kind == "national":
+        candidates = [
+            "word/media/image3.jpg",
+            "word/media/image3.jpeg",
+        ]
+    else:
+        candidates = [
+            "word/media/image1.jpeg",
+            "word/media/image1.jpg",
+        ]
+    with zipfile.ZipFile(docx_path, "r") as zf:
+        for name in candidates:
+            try:
+                return zf.read(name)
+            except KeyError:
+                continue
+    raise FileNotFoundError("封面蓝图缺少标准结束线图片：%s" % "；".join(candidates))
+
+
+def _reset_counters():
+    _COUNTER.table = 0
+    _COUNTER.figure = 0
+    _COUNTER.bm = 1000
+    _COUNTER.seq_scope_counts = {}
+
+
+def _configure_standard_styles(doc):
+    # 收紧列项/参考文献缩进（绝对磅值；正文段首行缩进=21pt≈2字）。
+    _fix_style_indent(doc, S.S_LIST_DASH, left_pt=42, hanging_pt=21)
+    _fix_style_indent(doc, "标准文件_破折号列项（二级）", left_pt=63, hanging_pt=21)
+    _fix_style_indent(doc, S.S_REF_ITEM, left_pt=21, hanging_pt=21)
+
+
 
 # --------------------------------------------------------------------------- #
 # 域 / 书签（SEQ 自动编号、REF 交叉引用）
@@ -78,6 +200,10 @@ def _set_numbering(para: Paragraph, num_id: int, ilvl: int):
 SEQ_TABLE    = "表"
 SEQ_FIGURE   = "图"
 SEQ_EQUATION = "公式"
+
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJ_DIR = os.path.dirname(_PKG_DIR)
+
 
 
 def _bm_name(anchor_id: str) -> str:
@@ -455,10 +581,37 @@ def _new_paragraph_before(anchor: Paragraph, doc, style_name: str,
     return para
 
 
+def _new_section_break_before(anchor: Paragraph, doc):
+    """在 anchor 前插入下一页分节符，cover 后端按模板节结构切分各部分。"""
+    new_p = OxmlElement("w:p")
+    anchor._p.addprevious(new_p)
+    para = Paragraph(new_p, anchor._parent)
+    ppr = para._p.get_or_add_pPr()
+    sectpr = copy.deepcopy(doc.sections[-1]._sectPr)
+    type_el = sectpr.find(qn("w:type"))
+    if type_el is None:
+        type_el = OxmlElement("w:type")
+        sectpr.insert(0, type_el)
+    type_el.set(qn("w:val"), "nextPage")
+    ppr.append(sectpr)
+    return para
+
+
 def _set_field(doc, style_name: str, text: str) -> bool:
     """把第一个套用 style_name 的段落文本替换为 text，保留首个 run 的格式。返回是否命中。"""
     for p in doc.paragraphs:
         if p.style is not None and p.style.name == style_name:
+            _replace_text_keep_format(p, text)
+            return True
+    return False
+
+
+def _set_field_or_placeholder(doc, style_name: str, text: str, patterns: List[str]) -> bool:
+    if _set_field(doc, style_name, text):
+        return True
+    for p in doc.paragraphs:
+        current = p.text.strip()
+        if any(re.search(pattern, current) for pattern in patterns):
             _replace_text_keep_format(p, text)
             return True
     return False
@@ -491,6 +644,24 @@ def _next_sectpr_para(doc, start: int) -> Optional[int]:
     """从 start（含）起，找下一个承载 sectPr 的段落索引。"""
     for i in range(start, len(doc.paragraphs)):
         if _carries_sectpr(doc.paragraphs[i]):
+            return i
+    return None
+
+
+def _prev_sectpr_para(doc, before: int) -> Optional[int]:
+    """从 before 之前向前找最近的承载 sectPr 的段落索引。"""
+    for i in range(before - 1, -1, -1):
+        if _carries_sectpr(doc.paragraphs[i]):
+            return i
+    return None
+
+
+def _find_first_appendix_mark(doc, before: Optional[int] = None) -> Optional[int]:
+    """查找模板中第一个附录标识段，用于分离正文样例和附录样例。"""
+    end = before if before is not None else len(doc.paragraphs)
+    for i in range(0, end):
+        p = doc.paragraphs[i]
+        if p.style is not None and p.style.name == S.S_APPENDIX_MARK:
             return i
     return None
 
@@ -542,7 +713,7 @@ def _enable_update_fields(doc):
 # --------------------------------------------------------------------------- #
 # 各节构建
 # --------------------------------------------------------------------------- #
-def _build_cover(doc, meta: model.Meta):
+def _apply_cover_fields(doc, meta: model.Meta, kind: Optional[str] = None):
     # ICS / CCS 表（封面第一个表格的两行第二列）
     if doc.tables:
         t = doc.tables[0]
@@ -554,22 +725,94 @@ def _build_cover(doc, meta: model.Meta):
         except IndexError:
             pass
 
-    if meta.standard_type:
-        _set_field(doc, S.S_COVER_TYPE, meta.standard_type)
+    standard_type = meta.standard_type
+    if kind == "national" and standard_type in ("", "国家标准", "中华人民共和国国家标准"):
+        standard_type = "中华人民共和国国家标准"
+    if standard_type:
+        _set_field_or_placeholder(doc, S.S_COVER_TYPE, standard_type, [
+            r"^团体标准$",
+            r"^中华人民共和国国家标准$",
+        ])
     if meta.number:
-        _set_field(doc, S.S_COVER_NUMBER, meta.number)
+        _set_field_or_placeholder(doc, S.S_COVER_NUMBER, meta.number, [
+            r"^T/XXX\s+XXXX",
+            r"^GB/T\s+XXXXX",
+            r"^GB\s+XXXXX",
+        ])
     if meta.replaces:
-        _set_field(doc, S.S_COVER_REPLACES, "代替 %s" % meta.replaces)
+        _set_field_or_placeholder(doc, S.S_COVER_REPLACES, "代替 %s" % meta.replaces, [
+            r"^代替\s+",
+        ])
     if meta.title:
-        _set_field(doc, S.S_COVER_NAME, meta.title)
+        _set_field_or_placeholder(doc, S.S_COVER_NAME, meta.title, [
+            r"^点击此处添加标准名称$",
+        ])
     if meta.title_en:
-        _set_field(doc, S.S_COVER_NAME_EN, meta.title_en)
+        _set_field_or_placeholder(doc, S.S_COVER_NAME_EN, meta.title_en, [
+            r"^点击此处添加标准名称的英文译名$",
+        ])
     if meta.publish_date:
-        _set_field(doc, S.S_COVER_PUBLISH, "%s发布" % meta.publish_date)
+        _set_field_or_placeholder(doc, S.S_COVER_PUBLISH, "%s发布" % meta.publish_date, [
+            r"^XXXX\s*-\s*XX\s*-\s*XX发布$",
+        ])
     if meta.implement_date:
-        _set_field(doc, S.S_COVER_IMPLEMENT, "%s实施" % meta.implement_date)
+        _set_field_or_placeholder(doc, S.S_COVER_IMPLEMENT, "%s实施" % meta.implement_date, [
+            r"^XXXX\s*-\s*XX\s*-\s*XX实施$",
+        ])
+    publisher_set = False
     if meta.publisher:
-        _set_field(doc, S.S_COVER_PUBLISHER, meta.publisher)
+        publisher_set = _set_field_or_placeholder(doc, S.S_COVER_PUBLISHER, meta.publisher, [])
+    return {"publisher": publisher_set}
+
+
+_COVER_PLACEHOLDER_RE = re.compile(
+    r"(\(?点击此处添加[^ \t\r\n<]*\)?)|"
+    r"(点击此处添加[^ \t\r\n<]*)|"
+    r"（本草案完成时间：）|"
+    r"XXXX\s*-\s*XX\s*-\s*XX(?:发布|实施)?"
+)
+
+
+def _cleanup_placeholder_paragraph(p: Paragraph):
+    text = p.text
+    if not text or not _COVER_PLACEHOLDER_RE.search(text):
+        return
+    cleaned = _COVER_PLACEHOLDER_RE.sub("", text).strip()
+    _replace_text_keep_format(p, cleaned)
+
+
+def _cleanup_cover_placeholders(doc):
+    for p in doc.paragraphs:
+        _cleanup_placeholder_paragraph(p)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    _cleanup_placeholder_paragraph(p)
+
+
+def _find_first_section_break_paragraph(doc) -> Optional[Paragraph]:
+    for p in doc.paragraphs:
+        if _carries_sectpr(p):
+            return p
+    return None
+
+
+def _ensure_cover_publisher(doc, publisher: str, cover_info: Optional[dict], kind: str = "group"):
+    if not publisher or (cover_info or {}).get("publisher"):
+        return
+    # 国家标准封面蓝图底部发布单位为打包图片；再插入文本段会与图片重叠。
+    if kind == "national":
+        return
+    anchor = _find_first_section_break_paragraph(doc)
+    if anchor is None:
+        para = doc.add_paragraph()
+    else:
+        para = _new_paragraph_before(anchor, doc, S.S_COVER_PUBLISHER)
+    if not para.runs:
+        para.add_run(publisher)
+    else:
+        _replace_text_keep_format(para, publisher)
 
 
 def _set_cell_text(cell, text):
@@ -595,21 +838,23 @@ def _build_toc(doc):
     _make_toc_field(term_p, doc)
 
 
-def _build_foreword(doc, meta: model.Meta):
+def _emit_foreword_content(anchor: Paragraph, doc, meta: model.Meta):
     fw = meta.foreword
-    idx = _find_para(doc, style_name=S.S_PREFACE_TITLE, text="前言")
-    if idx is None:
-        return
-    title_p = doc.paragraphs[idx]
-    term_idx = _next_sectpr_para(doc, idx + 1)
-    if term_idx is None:
-        return
-    term_p = doc.paragraphs[term_idx]
-    _remove_between(doc, title_p, term_p)
 
     def add(text):
         if text:
-            _new_paragraph_before(term_p, doc, S.S_PARA, text=text)
+            _new_paragraph_before(anchor, doc, S.S_PARA, text=text)
+
+    def add_extra_note(note):
+        if isinstance(note, (list, tuple)):
+            for item in note:
+                text = str(item).strip()
+                if text.startswith("- "):
+                    text = text[2:].strip()
+                if text:
+                    _new_paragraph_before(anchor, doc, S.S_LIST_DASH, text=text)
+            return
+        add(str(note).strip())
 
     add(bp.FOREWORD_FIRST)
     if fw.multipart_note:
@@ -623,7 +868,7 @@ def _build_foreword(doc, meta: model.Meta):
             lead = "与上一版相比，除结构调整和编辑性改动外，主要技术变化如下："
         add(lead)
         for ch in fw.replace_changes:
-            _new_paragraph_before(term_p, doc, S.S_LIST_DASH, text=ch)
+            _new_paragraph_before(anchor, doc, S.S_LIST_DASH, text=ch)
     if fw.patent_note:
         add(bp.PATENT_NOTE)
     # 提出 / 归口
@@ -642,7 +887,26 @@ def _build_foreword(doc, meta: model.Meta):
         add(bp.HISTORY_LEAD)
         add(fw.history)
     for note in fw.extra_notes:
-        add(note)
+        add_extra_note(note)
+
+
+def _build_foreword(doc, meta: model.Meta):
+    idx = _find_para(doc, style_name=S.S_PREFACE_TITLE, text="前言")
+    if idx is None:
+        return
+    title_p = doc.paragraphs[idx]
+    term_idx = _next_sectpr_para(doc, idx + 1)
+    if term_idx is None:
+        return
+    term_p = doc.paragraphs[term_idx]
+    _remove_between(doc, title_p, term_p)
+    _emit_foreword_content(term_p, doc, meta)
+
+
+def _emit_introduction_content(anchor: Paragraph, doc, meta: model.Meta):
+    for line in meta.introduction.splitlines():
+        if line.strip():
+            _new_paragraph_before(anchor, doc, S.S_PARA, text=line.strip())
 
 
 def _build_introduction(doc, meta: model.Meta):
@@ -657,9 +921,7 @@ def _build_introduction(doc, meta: model.Meta):
 
     if meta.introduction.strip():
         _remove_between(doc, title_p, term_p)
-        for line in meta.introduction.splitlines():
-            if line.strip():
-                _new_paragraph_before(term_p, doc, S.S_PARA, text=line.strip())
+        _emit_introduction_content(term_p, doc, meta)
     else:
         # 无引言：删除标题 + 区间内容 + 本节终止段（含其 sectPr），整节合并入正文
         _remove_between(doc, title_p, term_p)
@@ -766,6 +1028,19 @@ def _emit_body_block(anchor: Paragraph, doc, blk, in_terms=False, in_normrefs=Fa
     elif isinstance(blk, model.Formula):
         fstyle = S.S_FORMULA_APPENDIX if appendix_letter else S.S_FORMULA
         _emit_formula(anchor, doc, blk, style=fstyle, appendix_letter=appendix_letter)
+
+
+def _emit_body_standard_title(anchor: Paragraph, doc, meta: model.Meta):
+    title = (meta.title or "").strip()
+    if not title:
+        return
+    para = _new_paragraph_before(anchor, doc, S.S_BODY_STANDARD_NAME)
+    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for i, line in enumerate([x.strip() for x in title.splitlines() if x.strip()]):
+        if i > 0:
+            para.add_run().add_break()
+        run = para.add_run(line)
+        run.bold = True
 
 
 def _emit_formula(anchor: Paragraph, doc, formula, style=None, appendix_letter=None):
@@ -904,6 +1179,136 @@ def _emit_formula_caption_anchor(anchor: Paragraph, doc, formula: model.Formula,
     _add_bookmark_ends_after(seq_end_run, [bm_num_id, bm_label_id])
 
 
+_TABLE_SPLIT_THRESHOLD = 6
+_TABLE_SPLIT_CHUNK_SIZE = 5
+
+
+def _set_cell_vertical_center(cell):
+    tcpr = cell._tc.get_or_add_tcPr()
+    old = tcpr.find(qn("w:vAlign"))
+    if old is not None:
+        tcpr.remove(old)
+    valign = OxmlElement("w:vAlign")
+    valign.set(qn("w:val"), "center")
+    tcpr.append(valign)
+
+
+def _set_row_repeat_header(row):
+    trpr = row._tr.get_or_add_trPr()
+    if trpr.find(qn("w:tblHeader")) is None:
+        hdr = OxmlElement("w:tblHeader")
+        hdr.set(qn("w:val"), "true")
+        trpr.append(hdr)
+
+
+def _cell_is_long_text(text: str, colspan: int = 1) -> bool:
+    text = (text or "").strip()
+    return colspan > 1 or len(text) > 18 or "。" in text or "；" in text or "：" in text
+
+
+def _parts_from_text(text: str) -> List[model.TableCellPart]:
+    return [model.TableCellPart("text", text or "")]
+
+
+def _emit_table_cell_parts(paragraph: Paragraph, parts: List[model.TableCellPart]):
+    from . import mathconv
+    if not parts:
+        return
+    for part in parts:
+        if part.kind == "formula":
+            omath = mathconv.latex_to_omml(part.text)
+            if omath is not None:
+                paragraph._p.append(omath)
+            else:
+                paragraph.add_run(part.text)
+            continue
+        for i, piece in enumerate((part.text or "").split("\n")):
+            if i > 0:
+                paragraph.add_run().add_break()
+            if piece:
+                paragraph.add_run(piece)
+
+
+def _emit_table_continuation_caption(anchor: Paragraph, doc, tbl: model.TableModel,
+                                     appendix_letter=None):
+    style = S.S_APPENDIX_TABLE_CAPTION if appendix_letter else S.S_TABLE_CAPTION
+    cap = _new_paragraph_before(anchor, doc, style)
+    _set_numbering(cap, 0, 0)
+    if tbl.anchor_id:
+        _add_ref_bookmark(
+            cap,
+            _native_ref_name("tbl", tbl.anchor_id, "label"),
+            display_text="表?",
+        )
+    else:
+        cap.add_run("表")
+    cap.add_run("（续）")
+
+
+def _emit_table_part(anchor: Paragraph, doc, tbl: model.TableModel, rows, row_parts, row_colspans,
+                     appendix_letter=None):
+    """输出一个表格片段。续表复用原表头，不新增 SEQ。"""
+
+    def row_width(row, spans):
+        if spans:
+            return sum(spans[:len(row)])
+        return len(row)
+
+    widths = []
+    if tbl.header:
+        widths.append(row_width(tbl.header, tbl.header_colspans))
+    widths.extend(row_width(row, row_colspans[i] if i < len(row_colspans) else [])
+                  for i, row in enumerate(rows))
+    ncols = max(widths) if widths else 1
+    table = doc.add_table(rows=0, cols=ncols)
+    try:
+        table.style = doc.styles[S.S_TABLE_GRID]
+    except KeyError:
+        pass
+
+    all_rows = ([tbl.header] if tbl.header else []) + rows
+    header_parts = tbl.header_parts or [_parts_from_text(text) for text in tbl.header]
+    all_parts = ([header_parts] if tbl.header else []) + row_parts
+    all_spans = ([tbl.header_colspans or [1 for _ in tbl.header]] if tbl.header else [])
+    all_spans += [
+        row_colspans[i] if i < len(row_colspans) and row_colspans[i]
+        else [1 for _ in row]
+        for i, row in enumerate(rows)
+    ]
+
+    for r_i, row in enumerate(all_rows):
+        word_row = table.add_row()
+        if r_i == 0 and tbl.header:
+            _set_row_repeat_header(word_row)
+        cells = word_row.cells
+        spans = all_spans[r_i] if r_i < len(all_spans) else [1 for _ in row]
+        parts_row = all_parts[r_i] if r_i < len(all_parts) else []
+        c_pos = 0
+        for c_i, txt in enumerate(row):
+            if c_pos >= ncols:
+                break
+            colspan = spans[c_i] if c_i < len(spans) else 1
+            colspan = max(1, min(colspan, ncols - c_pos))
+            cell = cells[c_pos]
+            if colspan > 1:
+                cell = cell.merge(cells[c_pos + colspan - 1])
+            _set_cell_vertical_center(cell)
+            cp = cell.paragraphs[0]
+            try:
+                cp.style = doc.styles[S.S_TABLE_CELL]
+            except KeyError:
+                pass
+            cp.alignment = (
+                WD_ALIGN_PARAGRAPH.LEFT
+                if _cell_is_long_text(txt, colspan)
+                else WD_ALIGN_PARAGRAPH.CENTER
+            )
+            parts = parts_row[c_i] if c_i < len(parts_row) else _parts_from_text(txt)
+            _emit_table_cell_parts(cp, parts)
+            c_pos += colspan
+    anchor._p.addprevious(table._tbl)
+
+
 def _emit_table(anchor: Paragraph, doc, tbl: model.TableModel, appendix_letter=None):
     """表格：标题显式输出 `表N　标题`，模板样式只负责排版。"""
     style = S.S_APPENDIX_TABLE_CAPTION if appendix_letter else S.S_TABLE_CAPTION
@@ -914,26 +1319,35 @@ def _emit_table(anchor: Paragraph, doc, tbl: model.TableModel, appendix_letter=N
         appendix_letter=appendix_letter,
     )
 
-    # 表格本体
-    ncols = len(tbl.header) if tbl.header else (len(tbl.rows[0]) if tbl.rows else 1)
-    table = doc.add_table(rows=0, cols=ncols)
-    try:
-        table.style = doc.styles[S.S_TABLE_GRID]
-    except KeyError:
-        pass
-    all_rows = ([tbl.header] if tbl.header else []) + tbl.rows
-    for r_i, row in enumerate(all_rows):
-        cells = table.add_row().cells
-        for c_i in range(ncols):
-            txt = row[c_i] if c_i < len(row) else ""
-            cp = cells[c_i].paragraphs[0]
-            try:
-                cp.style = doc.styles[S.S_TABLE_CELL]
-            except KeyError:
-                pass
-            cp.add_run(txt)
-    # 把表格元素移动到 anchor 之前
-    anchor._p.addprevious(table._tbl)
+    row_parts = tbl.row_parts or [
+        [_parts_from_text(cell) for cell in row]
+        for row in tbl.rows
+    ]
+    row_colspans = tbl.row_colspans or [
+        [1 for _ in row]
+        for row in tbl.rows
+    ]
+    if len(tbl.rows) > _TABLE_SPLIT_THRESHOLD:
+        start = 0
+        first = True
+        while start < len(tbl.rows):
+            end = min(start + _TABLE_SPLIT_CHUNK_SIZE, len(tbl.rows))
+            if not first:
+                _emit_table_continuation_caption(anchor, doc, tbl, appendix_letter=appendix_letter)
+            _emit_table_part(
+                anchor,
+                doc,
+                tbl,
+                tbl.rows[start:end],
+                row_parts[start:end],
+                row_colspans[start:end],
+                appendix_letter=appendix_letter,
+            )
+            first = False
+            start = end
+        return
+
+    _emit_table_part(anchor, doc, tbl, tbl.rows, row_parts, row_colspans, appendix_letter=appendix_letter)
 
 
 def _emit_figure(anchor: Paragraph, doc, fig: model.Figure, appendix_letter=None):
@@ -955,27 +1369,33 @@ def _emit_figure(anchor: Paragraph, doc, fig: model.Figure, appendix_letter=None
     )
 
 
+def _emit_body_blocks(anchor: Paragraph, doc, blocks: List[object]):
+    blocks = _inject_chapter_boilerplate(blocks)
+    in_terms = False
+    in_normrefs = False
+    for blk in blocks:
+        if isinstance(blk, model.Heading) and blk.level == 1:
+            t = blk.text.strip()
+            in_terms = "术语" in t and "定义" in t
+            in_normrefs = "规范性引用文件" in t
+        _emit_body_block(anchor, doc, blk, in_terms=in_terms, in_normrefs=in_normrefs)
+
+
 def _build_body(doc, sdoc: model.StandardDoc):
     """正文：定位正文节（引言/前言 sectPr 之后到 body-sectPr），清空样例后插入。"""
     ref_idx = _find_para(doc, style_name=S.S_REF_TITLE, text="参考文献")
     if ref_idx is None:
         return
-    # 正文节终止段 = 参考文献标题前最近的承载 sectPr 的段落
-    term_idx = None
-    for i in range(ref_idx - 1, -1, -1):
-        if _carries_sectpr(doc.paragraphs[i]):
-            term_idx = i
-            break
+    # 国家模板在参考文献前可能带有示例附录节；正文边界应取首个附录前的分节符。
+    appendix_idx = _find_first_appendix_mark(doc, before=ref_idx)
+    boundary_idx = appendix_idx if appendix_idx is not None else ref_idx
+    term_idx = _prev_sectpr_para(doc, boundary_idx)
     if term_idx is None:
         return
     term_p = doc.paragraphs[term_idx]
 
     # 正文节起点：term 之前最近的另一个 sectPr 段（即引言/前言节终止段）
-    start_idx = None
-    for i in range(term_idx - 1, -1, -1):
-        if _carries_sectpr(doc.paragraphs[i]):
-            start_idx = i
-            break
+    start_idx = _prev_sectpr_para(doc, term_idx)
     start_p = doc.paragraphs[start_idx] if start_idx is not None else None
 
     # 清除正文节内既有样例（起点之后到终止段之间）
@@ -985,16 +1405,8 @@ def _build_body(doc, sdoc: model.StandardDoc):
         # 没有上游 sectPr，则清除文档开头到 term 之间——不应发生，保守跳过
         pass
 
-    # 注入正文块；对特殊空章自动补导语
-    blocks = _inject_chapter_boilerplate(sdoc.body)
-    in_terms = False
-    in_normrefs = False
-    for blk in blocks:
-        if isinstance(blk, model.Heading) and blk.level == 1:
-            t = blk.text.strip()
-            in_terms = "术语" in t and "定义" in t
-            in_normrefs = "规范性引用文件" in t
-        _emit_body_block(term_p, doc, blk, in_terms=in_terms, in_normrefs=in_normrefs)
+    _emit_body_standard_title(term_p, doc, sdoc.meta)
+    _emit_body_blocks(term_p, doc, sdoc.body)
 
 
 def _inject_chapter_boilerplate(body: List[object]) -> List[object]:
@@ -1021,25 +1433,16 @@ def _inject_chapter_boilerplate(body: List[object]) -> List[object]:
     return out
 
 
-def _build_appendices(doc, sdoc: model.StandardDoc):
-    if not sdoc.appendices:
-        return
-    ref_idx = _find_para(doc, style_name=S.S_REF_TITLE, text="参考文献")
-    if ref_idx is None:
-        return
-    # 附录应位于正文节内、参考文献分节符之前：取参考文献标题前最近的承载 sectPr 的段落
-    term_idx = None
-    for i in range(ref_idx - 1, -1, -1):
-        if _carries_sectpr(doc.paragraphs[i]):
-            term_idx = i
-            break
-    anchor = doc.paragraphs[term_idx] if term_idx is not None else doc.paragraphs[ref_idx]
-    for ai, appx in enumerate(sdoc.appendices):
+def _emit_appendices(anchor: Paragraph, doc, appendices: List[model.Appendix],
+                     page_break_before: bool = True, section_before_each: bool = False):
+    for ai, appx in enumerate(appendices):
+        if section_before_each:
+            _new_section_break_before(anchor, doc)
         letter = chr(ord("A") + ai)
         # 附录标题块：同一段三行，避免把附录标识、性质、标题拆成段落符。
         nature = bp.APPENDIX_NORMATIVE if appx.nature == "normative" else bp.APPENDIX_INFORMATIVE
         head = _new_paragraph_before(anchor, doc, S.S_APPENDIX_MARK)  # 自动"附录A"
-        head.paragraph_format.page_break_before = True
+        head.paragraph_format.page_break_before = page_break_before
         head.add_run().add_break()
         nature_run = head.add_run(nature)
         _apply_style_run_properties(doc, nature_run, S.S_APPENDIX_NATURE)
@@ -1051,6 +1454,33 @@ def _build_appendices(doc, sdoc: model.StandardDoc):
                 _new_paragraph_before(anchor, doc, style, spans=blk.spans)
             else:
                 _emit_body_block(anchor, doc, blk, appendix_letter=letter)
+
+
+def _clear_template_appendix_placeholders(doc):
+    """删除完整模板自带的示例附录节，避免国家模板残留附录A/B样例。"""
+    ref_idx = _find_para(doc, style_name=S.S_REF_TITLE, text="参考文献")
+    if ref_idx is None:
+        return
+    appendix_idx = _find_first_appendix_mark(doc, before=ref_idx)
+    if appendix_idx is None:
+        return
+    start_idx = _prev_sectpr_para(doc, appendix_idx)
+    if start_idx is None:
+        return
+    _remove_between(doc, doc.paragraphs[start_idx], doc.paragraphs[ref_idx])
+
+
+def _build_appendices(doc, sdoc: model.StandardDoc):
+    _clear_template_appendix_placeholders(doc)
+    ref_idx = _find_para(doc, style_name=S.S_REF_TITLE, text="参考文献")
+    if ref_idx is None:
+        return
+    if not sdoc.appendices:
+        return
+    # 附录应位于正文节内、参考文献分节符之前：取参考文献标题前最近的承载 sectPr 的段落
+    term_idx = _prev_sectpr_para(doc, ref_idx)
+    anchor = doc.paragraphs[term_idx] if term_idx is not None else doc.paragraphs[ref_idx]
+    _emit_appendices(anchor, doc, sdoc.appendices)
 
 
 def _move_index_end_line_before_section_break(title_p: Paragraph):
@@ -1178,29 +1608,122 @@ def _build_index(doc, sdoc: model.StandardDoc):
     body.remove(title_p._p)
 
 
+def _remove_paragraph(para: Paragraph):
+    parent = para._p.getparent()
+    parent.remove(para._p)
+
+
+def _emit_cover_toc(anchor: Paragraph, doc):
+    _new_paragraph_before(anchor, doc, S.S_TOC_TITLE, text="目次")
+    _make_toc_field(anchor, doc)
+
+
+def _emit_cover_foreword(anchor: Paragraph, doc, meta: model.Meta):
+    _new_paragraph_before(anchor, doc, S.S_PREFACE_TITLE, text="前言")
+    _emit_foreword_content(anchor, doc, meta)
+
+
+def _emit_cover_introduction(anchor: Paragraph, doc, meta: model.Meta):
+    if not meta.introduction.strip():
+        return
+    _new_paragraph_before(anchor, doc, S.S_PREFACE_TITLE, text="引言")
+    _emit_introduction_content(anchor, doc, meta)
+
+
+def _emit_cover_references(anchor: Paragraph, doc, sdoc: model.StandardDoc):
+    if not sdoc.references:
+        return
+    _new_paragraph_before(anchor, doc, S.S_REF_TITLE, text="参考文献")
+    for item in sdoc.references:
+        _new_paragraph_before(anchor, doc, S.S_REF_ITEM, text=item)
+
+
+def _emit_cover_index(anchor: Paragraph, doc, sdoc: model.StandardDoc):
+    if not sdoc.index_groups:
+        return
+    _new_paragraph_before(anchor, doc, S.S_INDEX_TITLE, text="索引")
+    for group in sdoc.index_groups:
+        _new_paragraph_before(anchor, doc, S.S_INDEX_LETTER, text=group.letter)
+        for item in group.items:
+            _emit_index_item(anchor, doc, item)
+
+
+def _emit_document_end_line(anchor: Paragraph, doc, image_bytes: bytes):
+    para = _new_paragraph_before(anchor, doc, S.S_PARA)
+    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    para.add_run().add_picture(io.BytesIO(image_bytes))
+
+
+def _emit_cover_sections(doc, sdoc: model.StandardDoc, end_line_image: bytes):
+    anchor = doc.add_paragraph()
+    _emit_cover_toc(anchor, doc)
+    _new_section_break_before(anchor, doc)
+    _emit_cover_foreword(anchor, doc, sdoc.meta)
+    _new_section_break_before(anchor, doc)
+    if sdoc.meta.introduction.strip():
+        _emit_cover_introduction(anchor, doc, sdoc.meta)
+    _new_section_break_before(anchor, doc)
+    _emit_body_standard_title(anchor, doc, sdoc.meta)
+    _emit_body_blocks(anchor, doc, sdoc.body)
+    if sdoc.appendices:
+        _emit_appendices(
+            anchor,
+            doc,
+            sdoc.appendices,
+            page_break_before=False,
+            section_before_each=True,
+        )
+    if sdoc.references:
+        _new_section_break_before(anchor, doc)
+        _emit_cover_references(anchor, doc, sdoc)
+    if sdoc.index_groups:
+        _new_section_break_before(anchor, doc)
+        _emit_cover_index(anchor, doc, sdoc)
+    _emit_document_end_line(anchor, doc, end_line_image)
+    _remove_paragraph(anchor)
+
+
 # --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
-def build(sdoc: model.StandardDoc, template_path: str, output_path: str):
-    _COUNTER.table = 0
-    _COUNTER.figure = 0
-    _COUNTER.bm = 1000
-    _COUNTER.seq_scope_counts = {}
+def build_cover(sdoc: model.StandardDoc, output_path: str, kind: str = "auto"):
+    """封面蓝图后端：以封面蓝图为基底，正文全部由代码顺序生成。"""
+    _reset_counters()
+
+    resolved_kind = _resolve_kind(kind, sdoc.meta)
+    cover_path = _default_cover_path(resolved_kind)
+
+    _copy_cover_base(cover_path, output_path)
+    end_line_image = _read_cover_end_line_image(output_path, resolved_kind)
+
+    doc = Document(output_path)
+    _configure_standard_styles(doc)
+
+    cover_info = _apply_cover_fields(doc, sdoc.meta, kind=resolved_kind)
+    _ensure_cover_publisher(doc, sdoc.meta.publisher, cover_info, kind=resolved_kind)
+    _cleanup_cover_placeholders(doc)
+
+    _emit_cover_sections(doc, sdoc, end_line_image)
+    _enable_update_fields(doc)
+
+    doc.save(output_path)
+    return output_path
+
+
+def build(sdoc: model.StandardDoc, template_path: str, output_path: str, kind: str = "auto"):
+    _reset_counters()
 
     # 复制模板再打开，避免改动原模板
     tmp = output_path
     shutil.copyfile(template_path, tmp)
     doc = Document(tmp)
 
-    # 收紧列项/参考文献缩进（绝对磅值；正文段首行缩进=21pt≈2字）：
-    #   破折号列项：破折号置于 2 字处(21pt)，文字悬挂到 42pt。
-    #   破折号列项（二级）：再缩进一层。
-    #   参考文献条目：编号[N]顶格，文字悬挂到 21pt。
-    _fix_style_indent(doc, S.S_LIST_DASH, left_pt=42, hanging_pt=21)
-    _fix_style_indent(doc, "标准文件_破折号列项（二级）", left_pt=63, hanging_pt=21)
-    _fix_style_indent(doc, S.S_REF_ITEM, left_pt=21, hanging_pt=21)
+    _configure_standard_styles(doc)
 
-    _build_cover(doc, sdoc.meta)
+    cover_kind = _resolve_kind(kind, sdoc.meta)
+    cover_info = _apply_cover_fields(doc, sdoc.meta, kind=cover_kind)
+    _ensure_cover_publisher(doc, sdoc.meta.publisher, cover_info, kind=cover_kind)
+    _cleanup_cover_placeholders(doc)
     _build_foreword(doc, sdoc.meta)
     _build_introduction(doc, sdoc.meta)
     _build_body(doc, sdoc)

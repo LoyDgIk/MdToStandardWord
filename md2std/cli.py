@@ -10,40 +10,59 @@ import sys
 from . import md_parser
 from . import docx_builder
 
-# 默认模板：优先 templates/团体标准模板.docx，回退到项目根的原始模板
+# 默认完整模板：template 后端按 kind 选择；_DEFAULT_TEMPLATE 保持团体模板用于旧测试兼容。
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJ_DIR = os.path.dirname(_PKG_DIR)
 
 
-def _resolve_default_template():
-    candidates = [
-        os.path.join(_PROJ_DIR, "templates", "团体标准模板.docx"),
-        os.path.join(_PROJ_DIR, "2 团体标准——模板.docx"),
-    ]
+def _resolve_default_template(kind="group"):
+    if kind == "national":
+        candidates = [
+            os.path.join(_PROJ_DIR, "templates", "国家标准模板.docx"),
+            os.path.join(_PROJ_DIR, "国家标准.docx"),
+        ]
+    else:
+        candidates = [
+            os.path.join(_PROJ_DIR, "templates", "团体标准模板.docx"),
+            os.path.join(_PROJ_DIR, "2 团体标准——模板.docx"),
+        ]
     for c in candidates:
         if os.path.isfile(c):
             return c
     return candidates[0]
 
 
-_DEFAULT_TEMPLATE = _resolve_default_template()
+def _resolve_kind(kind, meta):
+    if kind != "auto":
+        return kind
+    standard_type = (meta.standard_type or "").strip()
+    number = (meta.number or "").strip().upper()
+    if "国家" in standard_type or number.startswith("GB"):
+        return "national"
+    return "group"
+
+
+_DEFAULT_TEMPLATE = _resolve_default_template("group")
+_DEFAULT_NATIONAL_TEMPLATE = _resolve_default_template("national")
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="md2std",
-        description="把 Markdown 转换为团体标准（GB/T 1.1—2020）标准文本 Word。",
+        description="把 Markdown 转换为符合 GB/T 1.1—2020 结构的标准文本 Word。",
     )
     parser.add_argument("input", help="输入 Markdown 文件（含 YAML front matter）")
     parser.add_argument("-o", "--output", help="输出 .docx 路径（默认与输入同名）")
-    parser.add_argument("-t", "--template", default=_DEFAULT_TEMPLATE,
-                        help="模板 .docx 路径（默认使用内置团体标准模板）")
+    parser.add_argument("--backend", choices=("cover", "template"), default="cover",
+                        help="生成后端：cover=封面蓝图直接生成（默认），template=完整模板替换旧模式")
+    parser.add_argument("--kind", choices=("auto", "group", "national"), default="auto",
+                        help="标准类型：auto 根据 standard_type/编号判断，group=团体标准，national=国家标准")
+    parser.add_argument("-t", "--template",
+                        help="template 后端使用的完整模板 .docx 路径（默认按 kind 自动选择）")
     args = parser.parse_args(argv)
 
     if not os.path.isfile(args.input):
         parser.error("找不到输入文件：%s" % args.input)
-    if not os.path.isfile(args.template):
-        parser.error("找不到模板文件：%s" % args.template)
 
     output = args.output
     if not output:
@@ -54,7 +73,14 @@ def main(argv=None):
         text = f.read()
 
     sdoc = md_parser.parse(text)
-    docx_builder.build(sdoc, args.template, output)
+    if args.backend == "template":
+        resolved_kind = _resolve_kind(args.kind, sdoc.meta)
+        template_path = args.template or _resolve_default_template(resolved_kind)
+        if not os.path.isfile(template_path):
+            parser.error("找不到模板文件：%s" % template_path)
+        docx_builder.build(sdoc, template_path, output, kind=resolved_kind)
+    else:
+        docx_builder.build_cover(sdoc, output, kind=args.kind)
     # 避免中文控制台编码问题，使用 ascii 安全输出
     sys.stdout.write("OK -> %s\n" % output)
     return 0

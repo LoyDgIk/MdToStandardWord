@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+from html.parser import HTMLParser
 from typing import List, Tuple
 
 import yaml
@@ -163,6 +164,12 @@ def extract_formulas(md: str):
     return _FORMULA_LINE_RE.sub(repl, md), formulas
 
 
+def _normalize_extra_note(value):
+    if isinstance(value, (list, tuple)):
+        return [str(x) for x in value if str(x).strip()]
+    return str(value)
+
+
 def build_meta(data: dict) -> model.Meta:
     fw_raw = data.get("foreword") or {}
     fw = model.Foreword(
@@ -174,7 +181,7 @@ def build_meta(data: dict) -> model.Meta:
         draft_orgs=[str(x) for x in (fw_raw.get("draft_orgs") or [])],
         drafters=[str(x) for x in (fw_raw.get("drafters") or [])],
         history=str(fw_raw.get("history", "") or ""),
-        extra_notes=[str(x) for x in (fw_raw.get("extra_notes") or [])],
+        extra_notes=[_normalize_extra_note(x) for x in (fw_raw.get("extra_notes") or [])],
     )
 
     def s(key):
@@ -253,7 +260,7 @@ def _inline_image(inline_token):
 #   ('para',  spans)
 #   ('image', alt, src)
 #   ('list',  ordered:bool, items:List[List[Span]], level:int)
-#   ('table', header:List[str], rows:List[List[str]])
+#   ('table', header, rows, header_colspans, row_colspans, header_parts, row_parts)
 def _tokens_to_blocks(tokens, level=1):
     blocks = []
     i = 0
@@ -276,13 +283,20 @@ def _tokens_to_blocks(tokens, level=1):
             i += 3
         elif tt in ("bullet_list_open", "ordered_list_open"):
             ordered = tt == "ordered_list_open"
-            j, items = _parse_list(tokens, i, level)
+            j, items, nested_blocks = _parse_list(tokens, i, level)
             blocks.append(("list", ordered, items, level))
+            blocks.extend(nested_blocks)
             i = j
         elif tt == "table_open":
-            j, header, rows = _parse_table(tokens, i)
-            blocks.append(("table", header, rows))
+            j, header, rows, header_colspans, row_colspans, header_parts, row_parts = _parse_table(tokens, i)
+            blocks.append(("table", header, rows, header_colspans, row_colspans, header_parts, row_parts))
             i = j
+        elif tt == "html_block":
+            parsed = _parse_html_table_block(tok.content)
+            if parsed is not None:
+                header, rows, header_colspans, row_colspans, header_parts, row_parts = parsed
+                blocks.append(("table", header, rows, header_colspans, row_colspans, header_parts, row_parts))
+            i += 1
         elif tt in ("fence", "code_block"):
             # 代码块当作普通段落原样输出
             for line in tok.content.rstrip("\n").split("\n"):
@@ -306,38 +320,40 @@ def _tokens_to_blocks(tokens, level=1):
 
 
 def _parse_list(tokens, start, level):
-    """解析 list，返回 (下一个索引, items)。items 为 List[List[Span]]。
+    """解析 list，返回 (下一个索引, items, nested_blocks)。items 为 List[List[Span]]。
 
     简化处理：列项内的首段作为列项文本；列项内嵌套列表作为更深一级（level+1）
-    追加为后续 ('list', ...) 由调用者处理——此处把嵌套列表展开为额外 items 携带 level。
+    追加为后续 ('list', ...) 由调用者处理。
     """
     items: List[List[model.Span]] = []
+    nested_blocks = []
     i = start + 1  # skip *_list_open
     n = len(tokens)
-    depth = 1
-    nested_blocks = []
-    while i < n and depth > 0:
+    while i < n:
         tt = tokens[i].type
-        if tt in ("bullet_list_open", "ordered_list_open"):
-            depth += 1
-            i += 1
-            continue
         if tt in ("bullet_list_close", "ordered_list_close"):
-            depth -= 1
-            i += 1
-            continue
-        if tt == "list_item_open" and depth == 1:
+            return i + 1, items, nested_blocks
+        if tt == "list_item_open":
             # 收集该列项内首个 inline 段
             spans: List[model.Span] = []
             k = i + 1
             iddepth = 1
             captured = False
             while k < n and iddepth > 0:
-                if tokens[k].type == "list_item_open":
+                ttype = tokens[k].type
+                if ttype in ("bullet_list_open", "ordered_list_open") and iddepth == 1:
+                    ordered = ttype == "ordered_list_open"
+                    j, sub_items, sub_nested = _parse_list(tokens, k, level + 1)
+                    if sub_items:
+                        nested_blocks.append(("list", ordered, sub_items, level + 1))
+                    nested_blocks.extend(sub_nested)
+                    k = j
+                    continue
+                if ttype == "list_item_open":
                     iddepth += 1
-                elif tokens[k].type == "list_item_close":
+                elif ttype == "list_item_close":
                     iddepth -= 1
-                elif tokens[k].type == "inline" and not captured and iddepth == 1:
+                elif ttype == "inline" and not captured and iddepth == 1:
                     spans = _inline_to_spans(tokens[k])
                     captured = True
                 k += 1
@@ -345,15 +361,18 @@ def _parse_list(tokens, start, level):
             i = k
             continue
         i += 1
-    return i, items
+    return i, items, nested_blocks
 
 
 def _parse_table(tokens, start):
     header: List[str] = []
     rows: List[List[str]] = []
+    header_parts: List[List[model.TableCellPart]] = []
+    row_parts: List[List[List[model.TableCellPart]]] = []
     i = start + 1
     n = len(tokens)
     cur: List[str] = []
+    cur_parts: List[List[model.TableCellPart]] = []
     in_head = False
     while i < n:
         tt = tokens[i].type
@@ -366,17 +385,186 @@ def _parse_table(tokens, start):
             in_head = False
         elif tt == "tr_open":
             cur = []
+            cur_parts = []
         elif tt == "tr_close":
             if in_head:
                 header = cur
+                header_parts = cur_parts
             else:
                 rows.append(cur)
+                row_parts.append(cur_parts)
         elif tt in ("th_open", "td_open"):
             inline = tokens[i + 1] if i + 1 < n and tokens[i + 1].type == "inline" else None
-            txt = "".join(s.text for s in _inline_to_spans(inline)) if inline is not None else ""
+            parts = _parse_table_cell_parts(inline.content if inline is not None else "")
+            txt = _table_parts_text(parts)
             cur.append(txt)
+            cur_parts.append(parts)
         i += 1
-    return i, header, rows
+    return (
+        i,
+        header,
+        rows,
+        [1 for _ in header],
+        [[1 for _ in row] for row in rows],
+        header_parts,
+        row_parts,
+    )
+
+
+_TABLE_CELL_PART_RE = re.compile(r"(<eq>(.*?)</eq>|\$([^$]+)\$)", re.S | re.I)
+
+
+def _parse_table_cell_parts(text: str) -> List[model.TableCellPart]:
+    parts: List[model.TableCellPart] = []
+    pos = 0
+    for m in _TABLE_CELL_PART_RE.finditer(text or ""):
+        if m.start() > pos:
+            _append_text_part(parts, _normalize_html_cell_text(text[pos:m.start()]))
+        formula = (m.group(2) if m.group(2) is not None else m.group(3) or "").strip()
+        if formula:
+            parts.append(model.TableCellPart("formula", formula))
+        pos = m.end()
+    if pos < len(text or ""):
+        _append_text_part(parts, _normalize_html_cell_text((text or "")[pos:]))
+    if not parts:
+        parts.append(model.TableCellPart("text", ""))
+    return parts
+
+
+def _append_text_part(parts: List[model.TableCellPart], text: str):
+    if not text:
+        return
+    if parts and parts[-1].kind == "text":
+        parts[-1].text += text
+    else:
+        parts.append(model.TableCellPart("text", text))
+
+
+def _formula_display_text(latex: str) -> str:
+    text = latex or ""
+    text = text.replace(r"v_{\text{max}}", "vmax")
+    text = text.replace(r"v_{\mathrm{max}}", "vmax")
+    text = text.replace(r"\leqslant", "≤")
+    text = text.replace(r"\leq", "≤")
+    text = text.replace(r"\geqslant", "≥")
+    text = text.replace(r"\geq", "≥")
+    text = text.replace(r"\text{max}", "max")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _table_parts_text(parts: List[model.TableCellPart]) -> str:
+    out = []
+    for part in parts:
+        if part.kind == "formula":
+            out.append(_formula_display_text(part.text))
+        else:
+            out.append(part.text)
+    return "".join(out).strip()
+
+
+class _HtmlTableParser(HTMLParser):
+    """提取简单 HTML 表格，支持 th/td、colspan 和 br。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows = []
+        self._row = None
+        self._cell = None
+        self._cell_parts = None
+        self._capture = False
+        self._cell_is_header = False
+        self._cell_colspan = 1
+        self._inside_eq = False
+        self._eq_buf = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "tr":
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None:
+            attr_map = {k.lower(): v for k, v in attrs}
+            try:
+                colspan = int(attr_map.get("colspan") or "1")
+            except ValueError:
+                colspan = 1
+            self._cell = []
+            self._cell_parts = []
+            self._capture = True
+            self._cell_is_header = tag == "th"
+            self._cell_colspan = max(1, colspan)
+        elif tag == "eq" and self._capture and self._cell_parts is not None:
+            self._inside_eq = True
+            self._eq_buf = []
+        elif tag == "br" and self._capture and self._cell is not None:
+            self._cell.append("\n")
+            _append_text_part(self._cell_parts, "\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in ("td", "th") and self._row is not None and self._cell is not None:
+            text = _table_parts_text(self._cell_parts or [])
+            self._row.append({
+                "text": text,
+                "parts": self._cell_parts or [model.TableCellPart("text", text)],
+                "colspan": self._cell_colspan,
+                "header": self._cell_is_header,
+            })
+            self._cell = None
+            self._cell_parts = None
+            self._capture = False
+            self._cell_is_header = False
+            self._cell_colspan = 1
+        elif tag == "eq" and self._capture and self._cell_parts is not None:
+            formula = "".join(self._eq_buf).strip()
+            if formula:
+                self._cell_parts.append(model.TableCellPart("formula", formula))
+            self._inside_eq = False
+            self._eq_buf = []
+        elif tag == "tr" and self._row is not None:
+            if self._row:
+                self.rows.append(self._row)
+            self._row = None
+
+    def handle_data(self, data):
+        if self._capture and self._cell is not None:
+            self._cell.append(data)
+            if self._inside_eq:
+                self._eq_buf.append(data)
+            else:
+                _append_text_part(self._cell_parts, _normalize_html_cell_text(data))
+
+
+def _normalize_html_cell_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    text = text.replace(r"v_{\text{max}}", "vmax")
+    text = text.replace(r"v_{\mathrm{max}}", "vmax")
+    return text
+
+
+def _parse_html_table_block(content: str):
+    if "<table" not in content.lower():
+        return None
+    parser = _HtmlTableParser()
+    parser.feed(content)
+    rows = parser.rows
+    if not rows:
+        return None
+    first = rows[0]
+    use_first_as_header = any(cell["header"] for cell in first) or len(rows) > 1
+    if use_first_as_header:
+        header = [cell["text"] for cell in first]
+        header_parts = [cell["parts"] for cell in first]
+        header_colspans = [cell["colspan"] for cell in first]
+        data_rows = rows[1:]
+    else:
+        header = []
+        header_parts = []
+        header_colspans = []
+        data_rows = rows
+    body_rows = [[cell["text"] for cell in row] for row in data_rows]
+    row_parts = [[cell["parts"] for cell in row] for row in data_rows]
+    row_colspans = [[cell["colspan"] for cell in row] for row in data_rows]
+    return header, body_rows, header_colspans, row_colspans, header_parts, row_parts
 
 
 # --------------------------------------------------------------------------- #
@@ -565,11 +753,24 @@ def _make_block(kind, blk, table_caption):
         )
     if kind == "table":
         header, rows = blk[1], blk[2]
+        header_colspans = blk[3] if len(blk) > 3 else []
+        row_colspans = blk[4] if len(blk) > 4 else []
+        header_parts = blk[5] if len(blk) > 5 else []
+        row_parts = blk[6] if len(blk) > 6 else []
         if table_caption is None:
             cap, anchor = "", ""
         else:
             cap, anchor = table_caption
-        return model.TableModel(caption=cap, anchor_id=anchor, header=header, rows=rows)
+        return model.TableModel(
+            caption=cap,
+            anchor_id=anchor,
+            header=header,
+            rows=rows,
+            header_colspans=header_colspans,
+            row_colspans=row_colspans,
+            header_parts=header_parts,
+            row_parts=row_parts,
+        )
     return None
 
 

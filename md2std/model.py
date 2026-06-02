@@ -30,6 +30,13 @@ class RefSpan(Span):
     mode: str = "num"
 
 
+@dataclass
+class TableCellPart:
+    """表格单元格内片段。kind=text/formula，formula 使用 LaTeX 源码。"""
+    kind: str
+    text: str = ""
+
+
 # --------------------------------------------------------------------------- #
 # 块级元素
 # --------------------------------------------------------------------------- #
@@ -144,12 +151,18 @@ class TableModel:
 
     caption 仅为表题文字（不含"表N"，编号由 SEQ 域自动生成）。
     anchor_id 为类型化交叉引用本地 id（来自 `{#tbl:id}`）。
+    header_colspans/row_colspans 对应 HTML 表格的 colspan；GFM 表格默认为 1。
+    header_parts/row_parts 保存单元格内文本/公式片段；header/rows 保留纯文本视图。
     """
     ref_type: str = "tbl"
     caption: str = ""
     anchor_id: str = ""
     header: List[str] = field(default_factory=list)
     rows: List[List[str]] = field(default_factory=list)
+    header_colspans: List[int] = field(default_factory=list)
+    row_colspans: List[List[int]] = field(default_factory=list)
+    header_parts: List[List[TableCellPart]] = field(default_factory=list)
+    row_parts: List[List[List[TableCellPart]]] = field(default_factory=list)
 
 
 @dataclass
@@ -220,7 +233,7 @@ class Foreword:
     draft_orgs: List[str] = field(default_factory=list)
     drafters: List[str] = field(default_factory=list)
     history: str = ""
-    extra_notes: List[str] = field(default_factory=list)
+    extra_notes: List[object] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
