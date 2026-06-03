@@ -20,7 +20,7 @@ import zipfile
 from typing import List, Optional
 
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
@@ -66,6 +66,34 @@ def _set_numbering(para: Paragraph, num_id: int, ilvl: int):
         pstyle.addnext(numpr)
     else:
         ppr.insert(0, numpr)
+
+
+def _style_numbering(doc, style_name: str):
+    """读取模板样式自带的 numPr，返回 (numId, ilvl)。"""
+    try:
+        style = doc.styles[style_name]
+    except KeyError:
+        return None
+    ppr = style.element.find(qn("w:pPr"))
+    if ppr is None:
+        return None
+    numpr = ppr.find(qn("w:numPr"))
+    if numpr is None:
+        return None
+    numid = numpr.find(qn("w:numId"))
+    if numid is None or numid.get(qn("w:val")) is None:
+        return None
+    ilvl = numpr.find(qn("w:ilvl"))
+    return int(numid.get(qn("w:val"))), int(ilvl.get(qn("w:val")) if ilvl is not None and ilvl.get(qn("w:val")) is not None else 0)
+
+
+def _set_numbering_from_style(para: Paragraph, doc, style_name: str):
+    """显式套用模板样式的编号定义，避免 Word 忽略样式级列表缩进。"""
+    numbering = _style_numbering(doc, style_name)
+    if numbering is None:
+        return
+    num_id, ilvl = numbering
+    _set_numbering(para, num_id, ilvl)
 
 
 def _first_existing_path(candidates: List[str], label: str) -> str:
@@ -181,10 +209,13 @@ def _reset_counters():
 
 
 def _configure_standard_styles(doc):
-    # 收紧列项/参考文献缩进（绝对磅值；正文段首行缩进=21pt≈2字）。
-    _fix_style_indent(doc, S.S_LIST_DASH, left_pt=42, hanging_pt=21)
-    _fix_style_indent(doc, "标准文件_破折号列项（二级）", left_pt=63, hanging_pt=21)
-    _fix_style_indent(doc, S.S_REF_ITEM, left_pt=21, hanging_pt=21)
+    # 模板自带的破折号列项/参考文献缩进偏大。这里仍使用模板样式和编号，
+    # 只把编号级别缩进收敛到“自然段首行两字”附近。
+    _clear_style_indent(doc, S.S_LIST_DASH)
+    _clear_style_indent(doc, "标准文件_破折号列项（二级）")
+    _fix_numbering_style_indent(doc, S.S_LIST_DASH, left_twips=600, hanging_twips=200)
+    _fix_numbering_style_indent(doc, "标准文件_破折号列项（二级）", left_twips=920, hanging_twips=200)
+    _fix_numbering_style_indent(doc, S.S_REF_ITEM, left_twips=620, hanging_twips=420)
 
 
 
@@ -239,13 +270,15 @@ def _bookmark_end(para: Paragraph, bid: int):
     para._p.append(be)
 
 
-def _add_ref_bookmark(para: Paragraph, bookmark_name: str, display_text: str = "?"):
+def _add_ref_bookmark(para: Paragraph, bookmark_name: str, display_text: str = "?",
+                      charformat: bool = False):
     """插入 REF 域，引用指定书签。display_text 是域更新前的占位结果。"""
     r = para.add_run()
     fb = OxmlElement("w:fldChar"); fb.set(qn("w:fldCharType"), "begin"); r._r.append(fb)
     r = para.add_run()
     it = OxmlElement("w:instrText"); it.set(qn("xml:space"), "preserve")
-    it.text = " REF %s \\h " % bookmark_name
+    fmt = " \\* CHARFORMAT" if charformat else ""
+    it.text = " REF %s \\h%s " % (bookmark_name, fmt)
     r._r.append(it)
     r = para.add_run()
     fs = OxmlElement("w:fldChar"); fs.set(qn("w:fldCharType"), "separate"); r._r.append(fs)
@@ -283,7 +316,8 @@ def _hyperlink_run_instr(text: str):
 
 def _add_hyperlinked_ref_bookmark(para: Paragraph, hyperlink_anchor: str,
                                   ref_bookmark: str, prefix: str = "",
-                                  suffix: str = "", display_text: str = "?"):
+                                  suffix: str = "", display_text: str = "?",
+                                  charformat: bool = False):
     """插入一个外层整体可点击、内部编号可更新的 REF。"""
     link = OxmlElement("w:hyperlink")
     link.set(qn("w:anchor"), hyperlink_anchor)
@@ -291,7 +325,8 @@ def _add_hyperlinked_ref_bookmark(para: Paragraph, hyperlink_anchor: str,
     if prefix:
         link.append(_hyperlink_run_text(prefix))
     link.append(_hyperlink_run_fld_char("begin"))
-    link.append(_hyperlink_run_instr(" REF %s \\h " % ref_bookmark))
+    fmt = " \\* CHARFORMAT" if charformat else ""
+    link.append(_hyperlink_run_instr(" REF %s \\h%s " % (ref_bookmark, fmt)))
     link.append(_hyperlink_run_fld_char("separate"))
     link.append(_hyperlink_run_text(display_text))
     link.append(_hyperlink_run_fld_char("end"))
@@ -317,6 +352,7 @@ def _add_typed_ref(para: Paragraph, ref: model.RefSpan):
             prefix="式（",
             suffix="）",
             display_text="?",
+            charformat=True,
         )
         return
     _add_ref_bookmark(para, _native_ref_name(ref.ref_type, ref.target, ref.mode))
@@ -482,6 +518,21 @@ def _set_ind_pt(ind, left_pt=None, hanging_pt=None, first_line_pt=None):
         ind.set(qn("w:firstLine"), str(int(round(first_line_pt * _PT_TWIPS))))
 
 
+def _set_ind_twips(ind, left_twips=None, hanging_twips=None, first_line_twips=None):
+    """用 twips 重设 w:ind，供模板 numbering 级别微调用。"""
+    for a in ("firstLine", "firstLineChars", "hanging", "hangingChars",
+              "left", "leftChars", "start", "startChars", "end", "endChars"):
+        k = qn("w:" + a)
+        if ind.get(k) is not None:
+            del ind.attrib[k]
+    if left_twips is not None:
+        ind.set(qn("w:left"), str(left_twips))
+    if hanging_twips is not None:
+        ind.set(qn("w:hanging"), str(hanging_twips))
+    if first_line_twips is not None:
+        ind.set(qn("w:firstLine"), str(first_line_twips))
+
+
 def _set_ind(ind, left_chars=None, hanging_chars=None, first_line_chars=None):
     """重设 w:ind 的字符级缩进，清掉冲突属性。"""
     for a in ("firstLine", "firstLineChars", "hanging", "hangingChars", "left", "leftChars"):
@@ -511,6 +562,48 @@ def _fix_style_indent(doc, style_name, left_pt, hanging_pt):
         ind = OxmlElement("w:ind")
         ppr.append(ind)
     _set_ind_pt(ind, left_pt=left_pt, hanging_pt=hanging_pt)
+
+
+def _clear_style_indent(doc, style_name):
+    """移除段落样式自身缩进，避免与 numbering 缩进叠加。"""
+    try:
+        st = doc.styles[style_name]
+    except KeyError:
+        return
+    ppr = st.element.find(qn("w:pPr"))
+    if ppr is None:
+        return
+    ind = ppr.find(qn("w:ind"))
+    if ind is not None:
+        ppr.remove(ind)
+
+
+def _fix_numbering_style_indent(doc, style_name, left_twips, hanging_twips):
+    """按样式关联的 numbering level 修正列表/参考文献缩进。"""
+    try:
+        style = doc.styles[style_name]
+    except KeyError:
+        return
+    style_id = style.element.get(qn("w:styleId"))
+    if not style_id:
+        return
+    try:
+        numbering = doc.part.numbering_part.element
+    except Exception:
+        return
+    for lvl in numbering.findall(".//" + qn("w:lvl")):
+        pstyle = lvl.find(qn("w:pStyle"))
+        if pstyle is None or pstyle.get(qn("w:val")) != style_id:
+            continue
+        ppr = lvl.find(qn("w:pPr"))
+        if ppr is None:
+            ppr = OxmlElement("w:pPr")
+            lvl.append(ppr)
+        ind = ppr.find(qn("w:ind"))
+        if ind is None:
+            ind = OxmlElement("w:ind")
+            ppr.append(ind)
+        _set_ind_twips(ind, left_twips=left_twips, hanging_twips=hanging_twips)
 
 
 def _set_runs(paragraph: Paragraph, spans: List[model.Span]):
@@ -581,20 +674,141 @@ def _new_paragraph_before(anchor: Paragraph, doc, style_name: str,
     return para
 
 
-def _new_section_break_before(anchor: Paragraph, doc):
+def _new_numbered_style_paragraph(anchor: Paragraph, doc, style_name: str,
+                                  text: str = "", spans: Optional[List[model.Span]] = None) -> Paragraph:
+    para = _new_paragraph_before(anchor, doc, style_name, text=text, spans=spans)
+    _set_numbering_from_style(para, doc, style_name)
+    return para
+
+
+def _emit_page_break(anchor: Paragraph, doc) -> Paragraph:
+    para = _new_paragraph_before(anchor, doc, S.S_NORMAL)
+    para.add_run().add_break(WD_BREAK.PAGE)
+    return para
+
+
+def _clear_section_header_footer_refs(sectpr):
+    for tag in ("w:headerReference", "w:footerReference"):
+        for el in list(sectpr.findall(qn(tag))):
+            sectpr.remove(el)
+
+
+def _clear_section_page_number(sectpr):
+    old = sectpr.find(qn("w:pgNumType"))
+    if old is not None:
+        sectpr.remove(old)
+
+
+def _set_section_page_number(sectpr, fmt: Optional[str] = None, start: Optional[int] = None):
+    _clear_section_page_number(sectpr)
+    if fmt is None and start is None:
+        return
+    pg = OxmlElement("w:pgNumType")
+    if fmt:
+        pg.set(qn("w:fmt"), fmt)
+    if start is not None:
+        pg.set(qn("w:start"), str(start))
+    sectpr.append(pg)
+
+
+def _add_section_ref(sectpr, tag: str, ref_type: str, rel_id: Optional[str]):
+    if not rel_id:
+        return
+    ref = OxmlElement(tag)
+    ref.set(qn("w:type"), ref_type)
+    ref.set(qn("r:id"), rel_id)
+    sectpr.insert(0, ref)
+
+
+def _rel_target_number(rel) -> int:
+    m = re.search(r"(\d+)\.xml$", rel.target_ref or "")
+    return int(m.group(1)) if m else 0
+
+
+def _rel_blob(rel) -> str:
+    try:
+        return rel.target_part.blob.decode("utf-8", "ignore")
+    except Exception:
+        return ""
+
+
+def _body_page_refs(doc):
+    """查找封面蓝图中已打包的正文页眉/页脚关系。"""
+    styleref_headers = []
+    page_footers = []
+    for rid, rel in doc.part.rels.items():
+        reltype = rel.reltype.rsplit("/", 1)[-1]
+        blob = _rel_blob(rel)
+        if reltype == "header" and "STYLEREF" in blob and "标准文件_文件编号" in blob:
+            styleref_headers.append((rid, rel))
+        elif reltype == "footer" and "PAGE" in blob:
+            page_footers.append((rid, rel))
+
+    styleref_headers.sort(key=lambda item: _rel_target_number(item[1]))
+    page_footers.sort(key=lambda item: _rel_target_number(item[1]))
+
+    header_default = styleref_headers[0][0] if styleref_headers else None
+    header_even = styleref_headers[1][0] if len(styleref_headers) > 1 else header_default
+    footer_default = page_footers[-1][0] if page_footers else None
+    footer_even = page_footers[-2][0] if len(page_footers) > 1 else footer_default
+    return {
+        "header_default": header_default,
+        "header_even": header_even,
+        "footer_default": footer_default,
+        "footer_even": footer_even,
+    }
+
+
+def _configure_section(sectpr, refs: Optional[dict] = None,
+                       page_fmt: Optional[str] = None,
+                       page_start: Optional[int] = None,
+                       include_even: bool = False):
+    type_el = sectpr.find(qn("w:type"))
+    if type_el is None:
+        type_el = OxmlElement("w:type")
+        sectpr.insert(0, type_el)
+    type_el.set(qn("w:val"), "nextPage")
+    _clear_section_header_footer_refs(sectpr)
+    if refs:
+        _add_section_ref(sectpr, "w:headerReference", "default", refs.get("header_default"))
+        _add_section_ref(sectpr, "w:footerReference", "default", refs.get("footer_default"))
+        if include_even:
+            _add_section_ref(sectpr, "w:headerReference", "even", refs.get("header_even"))
+            _add_section_ref(sectpr, "w:footerReference", "even", refs.get("footer_even"))
+    _set_section_page_number(sectpr, fmt=page_fmt, start=page_start)
+
+
+def _new_section_break_before(anchor: Paragraph, doc, refs: Optional[dict] = None,
+                              page_fmt: Optional[str] = None,
+                              page_start: Optional[int] = None,
+                              include_even: bool = False):
     """在 anchor 前插入下一页分节符，cover 后端按模板节结构切分各部分。"""
     new_p = OxmlElement("w:p")
     anchor._p.addprevious(new_p)
     para = Paragraph(new_p, anchor._parent)
     ppr = para._p.get_or_add_pPr()
     sectpr = copy.deepcopy(doc.sections[-1]._sectPr)
-    type_el = sectpr.find(qn("w:type"))
-    if type_el is None:
-        type_el = OxmlElement("w:type")
-        sectpr.insert(0, type_el)
-    type_el.set(qn("w:val"), "nextPage")
+    _configure_section(
+        sectpr,
+        refs=refs,
+        page_fmt=page_fmt,
+        page_start=page_start,
+        include_even=include_even,
+    )
     ppr.append(sectpr)
     return para
+
+
+def _configure_final_section(doc, refs: Optional[dict] = None,
+                             page_start: Optional[int] = None,
+                             include_even: bool = False):
+    sectpr = doc.sections[-1]._sectPr
+    _configure_section(
+        sectpr,
+        refs=refs,
+        page_start=page_start,
+        include_even=include_even,
+    )
 
 
 def _set_field(doc, style_name: str, text: str) -> bool:
@@ -708,6 +922,16 @@ def _enable_update_fields(doc):
         uf = OxmlElement("w:updateFields")
         uf.set(qn("w:val"), "true")
         settings.append(uf)
+
+
+def _set_even_and_odd_headers(doc, enabled: bool):
+    settings = doc.settings.element
+    old = settings.find(qn("w:evenAndOddHeaders"))
+    if enabled:
+        if old is None:
+            settings.append(OxmlElement("w:evenAndOddHeaders"))
+    elif old is not None:
+        settings.remove(old)
 
 
 # --------------------------------------------------------------------------- #
@@ -852,7 +1076,7 @@ def _emit_foreword_content(anchor: Paragraph, doc, meta: model.Meta):
                 if text.startswith("- "):
                     text = text[2:].strip()
                 if text:
-                    _new_paragraph_before(anchor, doc, S.S_LIST_DASH, text=text)
+                    _new_numbered_style_paragraph(anchor, doc, S.S_LIST_DASH, text=text)
             return
         add(str(note).strip())
 
@@ -868,7 +1092,7 @@ def _emit_foreword_content(anchor: Paragraph, doc, meta: model.Meta):
             lead = "与上一版相比，除结构调整和编辑性改动外，主要技术变化如下："
         add(lead)
         for ch in fw.replace_changes:
-            _new_paragraph_before(anchor, doc, S.S_LIST_DASH, text=ch)
+            _new_numbered_style_paragraph(anchor, doc, S.S_LIST_DASH, text=ch)
     if fw.patent_note:
         add(bp.PATENT_NOTE)
     # 提出 / 归口
@@ -962,7 +1186,7 @@ def _emit_source(anchor: Paragraph, doc, source: model.Source):
 
 
 def _emit_term(anchor: Paragraph, doc, spans):
-    """术语条目：编号(3.1)单独成行，下一行黑体中文术语 + 英文对应词。
+    """术语条目：编号(3.1)单独成行，下一行加粗中文术语 + 英文对应词。
 
     自动编号接入 numId=2 ilvl=2（术语为章 3 下的一级条）。
     """
@@ -978,7 +1202,9 @@ def _emit_term(anchor: Paragraph, doc, spans):
     r = para.add_run(cn)
     r.bold = True
     if en:
-        para.add_run("　" + en)
+        para.add_run("　")
+        er = para.add_run(en)
+        er.bold = True
     return para
 
 
@@ -998,7 +1224,7 @@ def _emit_body_block(anchor: Paragraph, doc, blk, in_terms=False, in_normrefs=Fa
             _new_paragraph_before(anchor, doc, S.S_PARA, spans=blk.spans)
     elif isinstance(blk, model.UntitledClause):
         # 无标题条：套用"X级无标题"样式 + 接入正文多级列表(numId=2)自动编号，
-        # 不写字面编号；ilvl = 编号段数（"4.2.1" -> 3 段 -> ilvl=3 -> 渲染"4.2.1"）。
+        # Markdown 只声明层级；ilvl = 层级（3 -> 渲染为 "4.2.1"）。
         seg = blk.segments
         style = S.UNTITLED_STYLE_BY_SEGMENTS.get(seg, S.S_PARA)
         para = _new_paragraph_before(anchor, doc, style, spans=list(blk.spans))
@@ -1012,15 +1238,17 @@ def _emit_body_block(anchor: Paragraph, doc, blk, in_terms=False, in_normrefs=Fa
         _new_paragraph_before(anchor, doc, style, spans=blk.spans)
     elif isinstance(blk, model.ExampleContent):
         _new_paragraph_before(anchor, doc, S.S_EXAMPLE_CONTENT, spans=blk.spans)
+    elif isinstance(blk, model.PageBreak):
+        _emit_page_break(anchor, doc)
     elif isinstance(blk, model.Source):
         _emit_source(anchor, doc, blk)
     elif isinstance(blk, model.ListBlock):
         if blk.ordered:
-            style = S.ORDERED_LIST_STYLE_BY_LEVEL.get(blk.level, S.S_LIST_NUMBER)
+            style = S.ORDERED_LIST_STYLE_BY_LEVEL.get(blk.level, S.S_LIST_NUMBER_3)
         else:
             style = S.S_LIST_DASH
         for it in blk.items:
-            _new_paragraph_before(anchor, doc, style, spans=it.spans)
+            _new_numbered_style_paragraph(anchor, doc, style, spans=it.spans)
     elif isinstance(blk, model.TableModel):
         _emit_table(anchor, doc, blk, appendix_letter=appendix_letter)
     elif isinstance(blk, model.Figure):
@@ -1141,6 +1369,7 @@ def _emit_formula_number(para: Paragraph, formula: model.Formula, appendix_lette
             para,
             _native_ref_name("eq", formula.anchor_id, "num"),
             display_text=placeholder,
+            charformat=True,
         )
     else:
         para.add_run(placeholder)
@@ -1179,8 +1408,10 @@ def _emit_formula_caption_anchor(anchor: Paragraph, doc, formula: model.Formula,
     _add_bookmark_ends_after(seq_end_run, [bm_num_id, bm_label_id])
 
 
-_TABLE_SPLIT_THRESHOLD = 6
-_TABLE_SPLIT_CHUNK_SIZE = 5
+# 不按行数预拆续表。是否跨页只有 Word/LibreOffice 完成分页后才知道；
+# 生成阶段误拆会产生同页“续表”，因此默认只生成一个真实表格。
+_TABLE_SPLIT_THRESHOLD = None
+_TABLE_SPLIT_CHUNK_SIZE = None
 
 
 def _set_cell_vertical_center(cell):
@@ -1203,7 +1434,7 @@ def _set_row_repeat_header(row):
 
 def _cell_is_long_text(text: str, colspan: int = 1) -> bool:
     text = (text or "").strip()
-    return colspan > 1 or len(text) > 18 or "。" in text or "；" in text or "：" in text
+    return colspan > 1 or len(text) > 25 or "。" in text or "；" in text or "：" in text
 
 
 def _parts_from_text(text: str) -> List[model.TableCellPart]:
@@ -1231,9 +1462,10 @@ def _emit_table_cell_parts(paragraph: Paragraph, parts: List[model.TableCellPart
 
 def _emit_table_continuation_caption(anchor: Paragraph, doc, tbl: model.TableModel,
                                      appendix_letter=None):
-    style = S.S_APPENDIX_TABLE_CAPTION if appendix_letter else S.S_TABLE_CAPTION
+    style = "标准文件_表格续"
     cap = _new_paragraph_before(anchor, doc, style)
     _set_numbering(cap, 0, 0)
+    cap.paragraph_format.page_break_before = True
     if tbl.anchor_id:
         _add_ref_bookmark(
             cap,
@@ -1242,6 +1474,10 @@ def _emit_table_continuation_caption(anchor: Paragraph, doc, tbl: model.TableMod
         )
     else:
         cap.add_run("表")
+    title = (tbl.caption or "").strip()
+    if title:
+        cap.add_run("　")
+        cap.add_run(title)
     cap.add_run("（续）")
 
 
@@ -1327,7 +1563,7 @@ def _emit_table(anchor: Paragraph, doc, tbl: model.TableModel, appendix_letter=N
         [1 for _ in row]
         for row in tbl.rows
     ]
-    if len(tbl.rows) > _TABLE_SPLIT_THRESHOLD:
+    if _TABLE_SPLIT_THRESHOLD is not None and len(tbl.rows) > _TABLE_SPLIT_THRESHOLD:
         start = 0
         first = True
         while start < len(tbl.rows):
@@ -1434,11 +1670,12 @@ def _inject_chapter_boilerplate(body: List[object]) -> List[object]:
 
 
 def _emit_appendices(anchor: Paragraph, doc, appendices: List[model.Appendix],
-                     page_break_before: bool = True, section_before_each: bool = False):
+                     page_break_before: bool = True, section_before_each: bool = False,
+                     start_index: int = 0):
     for ai, appx in enumerate(appendices):
         if section_before_each:
             _new_section_break_before(anchor, doc)
-        letter = chr(ord("A") + ai)
+        letter = chr(ord("A") + start_index + ai)
         # 附录标题块：同一段三行，避免把附录标识、性质、标题拆成段落符。
         nature = bp.APPENDIX_NORMATIVE if appx.nature == "normative" else bp.APPENDIX_INFORMATIVE
         head = _new_paragraph_before(anchor, doc, S.S_APPENDIX_MARK)  # 自动"附录A"
@@ -1656,30 +1893,63 @@ def _emit_document_end_line(anchor: Paragraph, doc, image_bytes: bytes):
 
 def _emit_cover_sections(doc, sdoc: model.StandardDoc, end_line_image: bytes):
     anchor = doc.add_paragraph()
+    refs = _body_page_refs(doc)
+    include_even = sdoc.meta.odd_even_pages
+    body_started = False
+
+    def front_break(start: Optional[int] = None):
+        _new_section_break_before(
+            anchor,
+            doc,
+            refs=refs,
+            page_fmt="upperRoman",
+            page_start=start,
+            include_even=include_even,
+        )
+
+    def body_break(start: Optional[int] = None):
+        nonlocal body_started
+        _new_section_break_before(
+            anchor,
+            doc,
+            refs=refs,
+            page_start=start,
+            include_even=include_even,
+        )
+        body_started = True
+
     _emit_cover_toc(anchor, doc)
-    _new_section_break_before(anchor, doc)
+    front_break(start=1)
     _emit_cover_foreword(anchor, doc, sdoc.meta)
-    _new_section_break_before(anchor, doc)
     if sdoc.meta.introduction.strip():
+        front_break()
         _emit_cover_introduction(anchor, doc, sdoc.meta)
-    _new_section_break_before(anchor, doc)
+    front_break()
     _emit_body_standard_title(anchor, doc, sdoc.meta)
     _emit_body_blocks(anchor, doc, sdoc.body)
-    if sdoc.appendices:
+    for idx, appx in enumerate(sdoc.appendices):
+        body_break(start=1 if not body_started else None)
         _emit_appendices(
             anchor,
             doc,
-            sdoc.appendices,
+            [appx],
             page_break_before=False,
-            section_before_each=True,
+            section_before_each=False,
+            start_index=idx,
         )
     if sdoc.references:
-        _new_section_break_before(anchor, doc)
+        body_break(start=1 if not body_started else None)
         _emit_cover_references(anchor, doc, sdoc)
     if sdoc.index_groups:
-        _new_section_break_before(anchor, doc)
+        body_break(start=1 if not body_started else None)
         _emit_cover_index(anchor, doc, sdoc)
     _emit_document_end_line(anchor, doc, end_line_image)
+    _configure_final_section(
+        doc,
+        refs=refs,
+        page_start=1 if not body_started else None,
+        include_even=include_even,
+    )
     _remove_paragraph(anchor)
 
 
@@ -1705,6 +1975,7 @@ def build_cover(sdoc: model.StandardDoc, output_path: str, kind: str = "auto"):
 
     _emit_cover_sections(doc, sdoc, end_line_image)
     _enable_update_fields(doc)
+    _set_even_and_odd_headers(doc, sdoc.meta.odd_even_pages)
 
     doc.save(output_path)
     return output_path
@@ -1732,6 +2003,7 @@ def build(sdoc: model.StandardDoc, template_path: str, output_path: str, kind: s
     _build_index(doc, sdoc)
     _build_toc(doc)
     _enable_update_fields(doc)
+    _set_even_and_odd_headers(doc, sdoc.meta.odd_even_pages)
 
     doc.save(output_path)
     return output_path

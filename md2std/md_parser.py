@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from html.parser import HTMLParser
 from typing import List, Tuple
 
@@ -51,6 +52,11 @@ _CAPTION_NUMBER_RE = {
     "fig": re.compile(r"^\s*图\s*(?:[A-ZＡ-Ｚ]\s*[.．]\s*)?\d+(?:[.．]\d+)?\s*[\t 　]+"),
 }
 _FORMULA_TAG_RE = re.compile(r"\\tag\s*\{?")
+# 显式分页控制符：推荐写法为独立一行 `<!-- pagebreak -->`。
+_PAGE_BREAK_RE = re.compile(
+    r"^\s*(?:<!--\s*(?:md2std:)?pagebreak\s*-->|\\pagebreak|\\newpage|\[pagebreak\])\s*$",
+    re.I,
+)
 # 规范性引用文件条目："标准号  标准名称"。标准号允许不带年份。
 _NORMREF_RE = re.compile(r"^\s*([A-Z][A-Z/]*\s+\d[\w.\-—–]*)(?:\s{2,}|　+)(.+)$")
 
@@ -92,6 +98,10 @@ def _assert_clean_caption(ref_type: str, title: str, context: str):
 def _assert_clean_formula(latex: str, context: str):
     if _FORMULA_TAG_RE.search(latex or ""):
         raise ValueError("%s 不要使用 LaTeX \\tag 手写编号，编号由 Word SEQ 自动生成。" % context)
+
+
+def _is_page_break_marker(text: str) -> bool:
+    return _PAGE_BREAK_RE.match(text or "") is not None
 
 
 def _parse_ref_token(token: str, bold: bool = False, italic: bool = False) -> model.RefSpan:
@@ -170,6 +180,15 @@ def _normalize_extra_note(value):
     return str(value)
 
 
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    return text in ("1", "true", "yes", "y", "on", "是", "启用", "开启")
+
+
 def build_meta(data: dict) -> model.Meta:
     fw_raw = data.get("foreword") or {}
     fw = model.Foreword(
@@ -201,6 +220,7 @@ def build_meta(data: dict) -> model.Meta:
         publisher=s("publisher"),
         foreword=fw,
         introduction=s("introduction"),
+        odd_even_pages=_as_bool(data.get("odd_even_pages", False)),
     )
 
 
@@ -261,6 +281,7 @@ def _inline_image(inline_token):
 #   ('image', alt, src)
 #   ('list',  ordered:bool, items:List[List[Span]], level:int)
 #   ('table', header, rows, header_colspans, row_colspans, header_parts, row_parts)
+#   ('pagebreak',)
 def _tokens_to_blocks(tokens, level=1):
     blocks = []
     i = 0
@@ -296,6 +317,8 @@ def _tokens_to_blocks(tokens, level=1):
             if parsed is not None:
                 header, rows, header_colspans, row_colspans, header_parts, row_parts = parsed
                 blocks.append(("table", header, rows, header_colspans, row_colspans, header_parts, row_parts))
+            elif _is_page_break_marker(tok.content):
+                blocks.append(("pagebreak",))
             i += 1
         elif tt in ("fence", "code_block"):
             # 代码块当作普通段落原样输出
@@ -575,8 +598,9 @@ _EXAMPLE_RE = re.compile(r"^\s*示例\s*(\d+)?\s*[:：]")
 _SOURCE_RE = re.compile(r"^\s*\[?\s*来源\s*[:：]")
 _TABLE_CAP_RE = re.compile(r"^\s*\{\s*表\s*[:：]\s*#([^}\s]+)\s*\}\s+(.+?)\s*$")
 _TABLE_CAP_MARKER_RE = re.compile(r"^\s*(?:\{\s*)?表\s*[:：]")
-# 无标题条：以多段数字编号开头，后接内容，如 "4.2.1  正文……"
-_UNTITLED_RE = re.compile(r"^\s*(\d+(?:\.\d+)+)\s+(\S.*)$", re.S)
+# 无标题条：显式声明编号层级，不手写具体编号。
+_UNTITLED_RE = re.compile(r"^\s*\{\s*无标题条\s*[:：]\s*([2-6])\s*\}\s*(\S.*)$", re.S)
+_LEGACY_UNTITLED_RE = re.compile(r"^\s*(\d+(?:\.\d+)+)\s+(\S.*)$", re.S)
 _APPENDIX_RE = re.compile(r"^\s*附录\s*(?:[A-ZＡ-Ｚ]\s*)?[（(]?\s*(规范性|资料性)\s*[)）]?\s*(.*)$")
 _INDEX_GROUP_RE = re.compile(r"^[A-Z]$")
 _INDEX_ITEM_RE = re.compile(r"^\s*(.+?)\s*[:：]\s*(.+?)\s*$")
@@ -722,9 +746,13 @@ def parse(text: str) -> model.StandardDoc:
 
 
 def _make_block(kind, blk, table_caption):
+    if kind == "pagebreak":
+        return model.PageBreak()
     if kind == "para":
         spans = blk[1]
         ptext = _spans_text(spans)
+        if _is_page_break_marker(ptext.strip()):
+            return model.PageBreak()
         m = _NOTE_RE.match(ptext)
         if m:
             return model.Note(spans=spans, index=int(m.group(1)) if m.group(1) else None)
@@ -735,9 +763,19 @@ def _make_block(kind, blk, table_caption):
             return model.Source(text=ptext.strip())
         m = _UNTITLED_RE.match(ptext)
         if m:
-            number = m.group(1)
+            level = int(m.group(1))
             rest_spans = _strip_leading(spans, len(ptext) - len(m.group(2)))
-            return model.UntitledClause(number=number, spans=rest_spans)
+            return model.UntitledClause(level=level, spans=rest_spans)
+        m_legacy = _LEGACY_UNTITLED_RE.match(ptext)
+        if m_legacy:
+            level = len([x for x in m_legacy.group(1).split(".") if x])
+            warnings.warn(
+                "检测到旧式无标题条手写编号 `%s`；将按普通段落保留原文。"
+                "规范写法是 `{无标题条:%d} %s`。" %
+                (m_legacy.group(1), level, m_legacy.group(2).strip()),
+                UserWarning,
+                stacklevel=2,
+            )
         return model.Paragraph(spans=spans)
     if kind == "image":
         cap, raw_anchor = _pop_anchor(blk[1])

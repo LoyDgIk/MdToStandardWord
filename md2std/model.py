@@ -66,18 +66,28 @@ class Paragraph:
 
 
 @dataclass
-class UntitledClause:
-    """无标题条：带编号但无标题的悬挂段，如 "4.2.1  开发地热温泉资源前，应……"。
+class PageBreak:
+    """显式分页控制符。"""
+    pass
 
-    number  字面编号（如 "4.2.1"），保留原样、不自动编号。
+
+@dataclass
+class UntitledClause:
+    """无标题条：带编号但无标题的悬挂段。
+
+    level   编号层级，如 3 表示 X.Y.Z。
     spans   条文内容（不含编号）。
     """
-    number: str
+    level: int
     spans: List[Span] = field(default_factory=list)
 
     @property
     def segments(self) -> int:
-        return len([x for x in self.number.split(".") if x != ""])
+        return self.level
+
+    @property
+    def text(self) -> str:
+        return "".join(s.text for s in self.spans)
 
 
 @dataclass
@@ -253,6 +263,7 @@ class Meta:
     publisher: str = ""
     foreword: Foreword = field(default_factory=Foreword)
     introduction: str = ""
+    odd_even_pages: bool = False
 
 
 # --------------------------------------------------------------------------- #

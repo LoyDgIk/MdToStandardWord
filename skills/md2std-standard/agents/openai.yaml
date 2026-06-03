@@ -1,0 +1,4 @@
+interface:
+  display_name: "md2std Standard"
+  short_description: "Write standards Markdown and generate DOCX"
+  default_prompt: "Write a Chinese standard Markdown file and convert it to DOCX with md2std."

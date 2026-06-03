@@ -59,6 +59,8 @@ def main(argv=None):
                         help="标准类型：auto 根据 standard_type/编号判断，group=团体标准，national=国家标准")
     parser.add_argument("-t", "--template",
                         help="template 后端使用的完整模板 .docx 路径（默认按 kind 自动选择）")
+    parser.add_argument("--word-com-postprocess", "--word-com", action="store_true",
+                        help="生成后调用本机 Microsoft Word COM 更新域、重新分页并保存（默认不启用）")
     args = parser.parse_args(argv)
 
     if not os.path.isfile(args.input):
@@ -81,6 +83,12 @@ def main(argv=None):
         docx_builder.build(sdoc, template_path, output, kind=resolved_kind)
     else:
         docx_builder.build_cover(sdoc, output, kind=args.kind)
+    if args.word_com_postprocess:
+        from . import word_postprocess
+        try:
+            word_postprocess.postprocess_with_word_com(output)
+        except Exception as exc:
+            parser.error(str(exc))
     # 避免中文控制台编码问题，使用 ascii 安全输出
     sys.stdout.write("OK -> %s\n" % output)
     return 0

@@ -9,7 +9,7 @@ import unittest
 import zipfile
 import xml.etree.ElementTree as ET
 
-from md2std import cli, docx_builder, md_parser, model
+from md2std import cli, docx_builder, md_parser, model, word_postprocess
 
 
 def _build_docx_xml(markdown: str) -> str:
@@ -151,6 +151,58 @@ class CrossReferenceParserTest(unittest.TestCase):
             "所配轮胎气压为正常行驶用气压。",
         ])
 
+    def test_untitled_clause_uses_explicit_level_marker(self):
+        doc = md_parser.parse(
+            "# 范围\n\n"
+            "## 一般要求\n\n"
+            "{无标题条:3} 开发地热温泉资源前，应完成地质勘查。\n"
+        )
+
+        clause = next(b for b in doc.body if isinstance(b, model.UntitledClause))
+        self.assertEqual(clause.level, 3)
+        self.assertEqual(clause.text, "开发地热温泉资源前，应完成地质勘查。")
+
+    def test_legacy_untitled_clause_number_warns_and_stays_plain_paragraph(self):
+        with self.assertWarnsRegex(UserWarning, "旧式无标题条手写编号"):
+            doc = md_parser.parse("# 范围\n\n4.2.1  开发地热温泉资源前，应完成地质勘查。")
+
+        paragraph = next(b for b in doc.body if isinstance(b, model.Paragraph))
+        self.assertEqual(paragraph.text, "4.2.1  开发地热温泉资源前，应完成地质勘查。")
+
+    def test_odd_even_pages_metadata_defaults_false_and_parses_true(self):
+        default_doc = md_parser.parse("# 范围\n\n正文。\n")
+        enabled_doc = md_parser.parse(
+            "---\n"
+            "odd_even_pages: true\n"
+            "---\n\n"
+            "# 范围\n\n正文。\n"
+        )
+
+        self.assertFalse(default_doc.meta.odd_even_pages)
+        self.assertTrue(enabled_doc.meta.odd_even_pages)
+
+    def test_page_break_markers_parse_as_body_blocks(self):
+        doc = md_parser.parse(
+            "# 范围\n\n"
+            "分页前。\n\n"
+            "<!-- pagebreak -->\n\n"
+            "分页后。\n\n"
+            "\\pagebreak\n\n"
+            "末段。\n"
+        )
+
+        self.assertEqual(
+            [type(block) for block in doc.body],
+            [
+                model.Heading,
+                model.Paragraph,
+                model.PageBreak,
+                model.Paragraph,
+                model.PageBreak,
+                model.Paragraph,
+            ],
+        )
+
     def test_foreword_extra_notes_support_dash_list_group(self):
         doc = md_parser.parse(
             "---\n"
@@ -240,6 +292,35 @@ class CrossReferenceDocxTest(unittest.TestCase):
                 ET.tostring(run, encoding="unicode"),
             )
 
+    def test_formula_visible_number_refs_do_not_inherit_hidden_formatting(self):
+        xml = _build_docx_xml(
+            "# 范围\n\n"
+            "按{{eq:rate:label}}计算。\n\n"
+            "$$H=(T_r-T_0)/G+h$${#eq:rate}\n"
+        )
+
+        self.assertGreaterEqual(xml.count("\\* CHARFORMAT"), 2)
+        self.assertIn(" REF _Ref", xml)
+        self.assertIn("\\h \\* CHARFORMAT", xml)
+
+    def test_term_chinese_and_english_terms_are_bold(self):
+        xml = _build_docx_xml(
+            "# 术语和定义\n\n"
+            "## 地热温泉  geothermal hot spring\n\n"
+            "出水温度不低于25 ℃的地下热水天然露头或人工揭露点。\n"
+        )
+        root = ET.fromstring(xml)
+        paragraph = self._et_paragraph_containing(root, "geothermal hot spring")
+        self.assertIsNotNone(paragraph)
+        bold_texts = [
+            "".join(t.text or "" for t in run.findall(".//w:t", self._W_NS))
+            for run in paragraph.findall("w:r", self._W_NS)
+            if run.find("w:rPr/w:b", self._W_NS) is not None
+        ]
+
+        self.assertIn("地热温泉", bold_texts)
+        self.assertIn("geothermal hot spring", bold_texts)
+
     def test_declared_standard_styles_are_used_for_examples_sources_and_appendix_title(self):
         xml = _build_docx_xml(
             "# 范围\n\n"
@@ -276,6 +357,16 @@ class CrossReferenceDocxTest(unittest.TestCase):
 
         self.assertIsNotNone(appendix_head)
         self.assertIsNotNone(appendix_head.find("w:pPr/w:pageBreakBefore", self._W_NS))
+
+    def test_body_page_break_marker_emits_real_word_page_break(self):
+        xml = _build_docx_xml(
+            "# 范围\n\n"
+            "分页前。\n\n"
+            "<!-- pagebreak -->\n\n"
+            "分页后。\n"
+        )
+
+        self.assertIn('<w:br w:type="page"/>', xml)
 
     def test_document_end_line_follows_references_before_section_break(self):
         xml = _build_docx_xml(
@@ -405,6 +496,26 @@ class CrossReferenceDocxTest(unittest.TestCase):
                 self.assertLess(para.index(f"<w:t>{prefix}</w:t>"), field_end)
             self.assertGreater(para.index(f'<w:bookmarkEnd w:id="{label_id}"/>'), field_end)
             self.assertGreater(para.index(f'<w:bookmarkEnd w:id="{num_id}"/>'), field_end)
+
+    def test_nested_ordered_list_uses_template_multilevel_numbering(self):
+        xml = _build_docx_xml(
+            "# 范围\n\n"
+            "1. 车辆装备：\n"
+            "   1. 为整备质量再加上驾驶员。\n"
+            "   2. 所配轮胎气压为正常行驶用气压。\n"
+        )
+        root = ET.fromstring(xml)
+        top = self._et_paragraph_containing(root, "车辆装备")
+        nested = self._et_paragraph_containing(root, "整备质量")
+
+        self.assertIsNotNone(top)
+        self.assertIsNotNone(nested)
+        self.assertIsNotNone(top.find('w:pPr/w:pStyle[@w:val="174"]', self._W_NS))
+        self.assertIsNotNone(top.find('w:pPr/w:numPr/w:numId[@w:val="13"]', self._W_NS))
+        self.assertIsNotNone(top.find('w:pPr/w:numPr/w:ilvl[@w:val="0"]', self._W_NS))
+        self.assertIsNotNone(nested.find('w:pPr/w:pStyle[@w:val="109"]', self._W_NS))
+        self.assertIsNotNone(nested.find('w:pPr/w:numPr/w:numId[@w:val="13"]', self._W_NS))
+        self.assertIsNotNone(nested.find('w:pPr/w:numPr/w:ilvl[@w:val="1"]', self._W_NS))
 
     def _paragraph_containing(self, xml: str, text: str) -> str:
         text_pos = xml.index(text)
@@ -614,6 +725,72 @@ class CoverBackendDocxTest(unittest.TestCase):
                 blocking_texts = [t for t in texts[prev_section + 1:idx] if t.strip()]
                 self.assertEqual(blocking_texts, [], marker)
 
+    def test_cover_backend_page_numbering_sections_use_template_headers(self):
+        parts = _build_cover_docx_parts(
+            "---\n"
+            "title: 分节页码测试标准\n"
+            "---\n"
+            "# 范围\n\n"
+            "正文。\n\n"
+            "# 附录 规范性 第一附录\n\n"
+            "附录正文。\n\n"
+            "# 附录 资料性 第二附录\n\n"
+            "第二附录正文。\n\n"
+            "# 参考文献\n\n"
+            "GB/T 1.1—2020　标准化工作导则\n\n"
+            "# 索引\n\n"
+            "## B\n\n"
+            "- 标准：1\n"
+        )
+        sections = self._sections(parts["document"])
+
+        self.assertGreaterEqual(len(sections), 8)
+        self.assertEqual(self._pg_num(sections[1]), ("upperRoman", "1"))
+        self.assertEqual(self._pg_num(sections[2]), ("upperRoman", ""))
+        self.assertEqual(self._pg_num(sections[3]), ("", "1"))
+        for section in sections[1:]:
+            refs = self._section_refs(section)
+            self.assertIn(("headerReference", "default"), refs)
+            self.assertIn(("footerReference", "default"), refs)
+
+    def test_cover_backend_odd_even_pages_setting_is_metadata_controlled(self):
+        default_parts = _build_cover_docx_parts("# 范围\n\n正文。\n")
+        enabled_parts = _build_cover_docx_parts(
+            "---\n"
+            "odd_even_pages: true\n"
+            "---\n\n"
+            "# 范围\n\n正文。\n"
+        )
+        default_settings = ET.fromstring(default_parts["settings"])
+        enabled_settings = ET.fromstring(enabled_parts["settings"])
+        enabled_sections = self._sections(enabled_parts["document"])
+
+        self.assertIsNone(default_settings.find("w:evenAndOddHeaders", self._W_NS))
+        self.assertIsNotNone(enabled_settings.find("w:evenAndOddHeaders", self._W_NS))
+        refs = self._section_refs(enabled_sections[1])
+        self.assertIn(("headerReference", "even"), refs)
+        self.assertIn(("footerReference", "even"), refs)
+
+    def test_cover_backend_tunes_dash_and_reference_numbering_indents(self):
+        parts = _build_cover_docx_parts(
+            "# 范围\n\n"
+            "勘测工作应重点查明以下内容：\n\n"
+            "- 热储层的埋深、厚度、岩性组合、孔隙度和渗透率；\n\n"
+            "# 参考文献\n\n"
+            "GB/T 11615　地热资源地质勘查规范\n"
+        )
+
+        self.assertEqual(self._numbering_ind_by_style(parts["numbering"], "92"), {
+            "left": "600",
+            "hanging": "200",
+        })
+        self.assertEqual(self._numbering_ind_by_style(parts["numbering"], "64"), {
+            "left": "620",
+            "hanging": "420",
+        })
+        self.assertIsNone(self._style_ind_by_id(parts["styles"], "92"))
+        self.assertIsNone(self._style_ind_by_id(parts["styles"], "93"))
+
     def test_cover_backend_group_and_national_cover_metadata(self):
         cases = [
             (
@@ -699,10 +876,6 @@ class CoverBackendDocxTest(unittest.TestCase):
     def test_cover_backend_uses_cover_blueprint_parts(self):
         parts = _build_cover_docx_parts("# 范围\n\n正文。\n", kind="group")
         with zipfile.ZipFile(os.path.join("templates", "cover_group.docx")) as zf:
-            self.assertEqual(
-                self._canonical_xml(parts["numbering"]),
-                self._canonical_xml(zf.read("word/numbering.xml")),
-            )
             self.assertEqual(self._style_names(parts["styles"]), self._style_names(zf.read("word/styles.xml")))
             self.assertNotEqual(parts["document"], zf.read("word/document.xml"))
 
@@ -754,8 +927,22 @@ class CoverBackendDocxTest(unittest.TestCase):
         self.assertIn("<w:jc w:val=\"center\"/>", xml)
         self.assertIn("<w:jc w:val=\"left\"/>", xml)
 
-    def test_docx_long_table_is_split_as_continued_table(self):
+    def test_docx_moderate_table_is_not_split_as_continued_table(self):
         rows = "".join("| %d | 值%d |\n" % (i, i) for i in range(1, 8))
+        xml = _build_docx_xml(
+            "# 范围\n\n"
+            "{表：#tbl:moderate} 中等表\n\n"
+            "| 项 | 值 |\n"
+            "| --- | --- |\n" +
+            rows
+        )
+
+        self.assertEqual(xml.count(" SEQ 表 "), 1)
+        self.assertNotIn("（续）", xml)
+        self.assertEqual(xml.count("<w:tblHeader w:val=\"true\"/>"), 1)
+
+    def test_docx_long_table_is_not_split_before_render_pagination(self):
+        rows = "".join("| %d | 值%d |\n" % (i, i) for i in range(1, 14))
         xml = _build_docx_xml(
             "# 范围\n\n"
             "{表：#tbl:long} 长表\n\n"
@@ -765,9 +952,48 @@ class CoverBackendDocxTest(unittest.TestCase):
         )
 
         self.assertEqual(xml.count(" SEQ 表 "), 1)
-        self.assertIn("（续）", xml)
-        self.assertIn(" REF _Ref", xml)
-        self.assertGreaterEqual(xml.count("<w:tblHeader w:val=\"true\"/>"), 2)
+        self.assertNotIn("（续）", xml)
+        self.assertEqual(xml.count("<w:tblHeader w:val=\"true\"/>"), 1)
+
+    def test_word_postprocess_splits_continuation_table_from_measured_plan(self):
+        sdoc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:split} 测试表\n\n"
+            "| 唯一表头 | 值 |\n"
+            "| --- | --- |\n"
+            "| 一 | 1 |\n"
+            "| 二 | 2 |\n"
+            "| 三 | 3 |\n"
+            "| 四 | 4 |\n"
+        )
+        fd, path = tempfile.mkstemp(suffix=".docx")
+        os.close(fd)
+        try:
+            docx_builder.build_cover(sdoc, path)
+            changed = word_postprocess._apply_table_continuations(path, [
+                word_postprocess._TableContinuationPlan(
+                    table_index=2,
+                    row_breaks=[4],
+                    header_count=1,
+                    caption_text="表1　测试表（续）",
+                )
+            ])
+            with zipfile.ZipFile(path) as zf:
+                xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+        self.assertTrue(changed)
+        self.assertIn("表1　测试表（续）", xml)
+        self.assertIn('w:pStyle w:val="185"', xml)
+        self.assertEqual(xml.count(" SEQ 表 "), 1)
+        self.assertEqual(xml.count("唯一表头"), 2)
+        root = ET.fromstring(xml)
+        self.assertEqual(len(root.findall(".//w:tblHeader", self._W_NS)), 2)
+        continuation = self._et_paragraph_containing(root, "表1　测试表（续）")
+        self.assertIsNotNone(continuation)
+        self.assertIsNotNone(continuation.find("w:pPr/w:pageBreakBefore", self._W_NS))
 
     def test_cover_blueprints_keep_complete_cover_section(self):
         pairs = [
@@ -798,12 +1024,67 @@ class CoverBackendDocxTest(unittest.TestCase):
     def _et_text(self, element) -> str:
         return "".join(t.text or "" for t in element.findall(".//w:t", self._W_NS))
 
+    def _et_paragraph_containing(self, root, text: str):
+        for paragraph in root.findall(".//w:p", self._W_NS):
+            if text in self._et_text(paragraph):
+                return paragraph
+        return None
+
     def _jc_value(self, paragraph) -> str:
         jc = paragraph.find("w:pPr/w:jc", self._W_NS)
         return jc.get(self._w_tag("val")) if jc is not None else ""
 
     def _w_tag(self, name: str) -> str:
         return "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}" + name
+
+    def _sections(self, document_xml: bytes) -> list:
+        root = ET.fromstring(document_xml)
+        body = root.find("w:body", self._W_NS)
+        sections = []
+        for paragraph in body.findall("w:p", self._W_NS):
+            sect = paragraph.find("w:pPr/w:sectPr", self._W_NS)
+            if sect is not None:
+                sections.append(sect)
+        final_sect = body.find("w:sectPr", self._W_NS)
+        if final_sect is not None:
+            sections.append(final_sect)
+        return sections
+
+    def _pg_num(self, section) -> tuple:
+        pg = section.find("w:pgNumType", self._W_NS)
+        if pg is None:
+            return "", ""
+        return pg.get(self._w_tag("fmt"), ""), pg.get(self._w_tag("start"), "")
+
+    def _section_refs(self, section) -> set:
+        refs = set()
+        for child in section:
+            local = child.tag.rsplit("}", 1)[-1]
+            if local in ("headerReference", "footerReference"):
+                refs.add((local, child.get(self._w_tag("type"))))
+        return refs
+
+    def _numbering_ind_by_style(self, numbering_xml: bytes, style_id: str) -> dict:
+        root = ET.fromstring(numbering_xml)
+        for lvl in root.findall(".//w:lvl", self._W_NS):
+            pstyle = lvl.find("w:pStyle", self._W_NS)
+            if pstyle is None or pstyle.get(self._w_tag("val")) != style_id:
+                continue
+            ind = lvl.find("w:pPr/w:ind", self._W_NS)
+            self.assertIsNotNone(ind)
+            return {
+                key.rsplit("}", 1)[-1]: value
+                for key, value in ind.attrib.items()
+            }
+        raise AssertionError("找不到编号样式：%s" % style_id)
+
+    def _style_ind_by_id(self, styles_xml: bytes, style_id: str):
+        root = ET.fromstring(styles_xml)
+        for style in root.findall(".//w:style", self._W_NS):
+            if style.get(self._w_tag("styleId")) != style_id:
+                continue
+            return style.find("w:pPr/w:ind", self._W_NS)
+        raise AssertionError("找不到样式：%s" % style_id)
 
     def _style_names(self, styles_xml: bytes) -> set:
         root = ET.fromstring(styles_xml)
@@ -853,6 +1134,95 @@ class CoverBackendDocxTest(unittest.TestCase):
             if child.find("w:pPr/w:sectPr", self._W_NS) is not None:
                 break
         return texts
+
+
+class CliPostprocessTest(unittest.TestCase):
+    def test_word_com_postprocess_is_called_only_when_flag_is_enabled(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_path = os.path.join(td, "input.md")
+            output_path = os.path.join(td, "output.docx")
+            with open(input_path, "w", encoding="utf-8") as f:
+                f.write("# 范围\n\n正文。\n")
+
+            with unittest.mock.patch("md2std.docx_builder.build_cover", return_value=output_path), \
+                 unittest.mock.patch("md2std.word_postprocess.postprocess_with_word_com", return_value=output_path) as post:
+                self.assertEqual(cli.main([input_path, "-o", output_path]), 0)
+                post.assert_not_called()
+
+                self.assertEqual(cli.main([input_path, "-o", output_path, "--word-com-postprocess"]), 0)
+                post.assert_called_once_with(output_path)
+
+    def test_word_postprocess_replaces_target_only_after_temp_copy_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = os.path.join(td, "target.docx")
+            with open(target, "wb") as f:
+                f.write(b"original")
+
+            class FakeWord:
+                Hwnd = 0
+
+                def __init__(self):
+                    self.quit_count = 0
+
+                def Quit(self):
+                    self.quit_count += 1
+
+            word = FakeWord()
+            seen_work_paths = []
+
+            def fake_process(_word, work_path):
+                seen_work_paths.append(work_path)
+                self.assertNotEqual(os.path.abspath(target), work_path)
+                with open(work_path, "wb") as f:
+                    f.write(b"processed")
+
+            with unittest.mock.patch("md2std.word_postprocess._postprocess_document", fake_process):
+                word_postprocess._postprocess_with_word_instance(
+                    os.path.abspath(target),
+                    word,
+                    timeout_seconds=0,
+                )
+
+            with open(target, "rb") as f:
+                self.assertEqual(f.read(), b"processed")
+            self.assertEqual(word.quit_count, 1)
+            self.assertEqual(self._temp_wordcom_files(td), [])
+            self.assertEqual(len(seen_work_paths), 1)
+
+    def test_word_postprocess_failure_keeps_target_and_removes_temp_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = os.path.join(td, "target.docx")
+            with open(target, "wb") as f:
+                f.write(b"original")
+
+            class FakeWord:
+                Hwnd = 0
+
+                def Quit(self):
+                    pass
+
+            def fake_process(_word, work_path):
+                with open(work_path, "wb") as f:
+                    f.write(b"partial")
+                raise RuntimeError("boom")
+
+            with unittest.mock.patch("md2std.word_postprocess._postprocess_document", fake_process):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    word_postprocess._postprocess_with_word_instance(
+                        os.path.abspath(target),
+                        FakeWord(),
+                        timeout_seconds=0,
+                    )
+
+            with open(target, "rb") as f:
+                self.assertEqual(f.read(), b"original")
+            self.assertEqual(self._temp_wordcom_files(td), [])
+
+    def _temp_wordcom_files(self, directory: str) -> list:
+        return sorted(
+            name for name in os.listdir(directory)
+            if name.startswith(".md2std-wordcom-")
+        )
 
 
 if __name__ == "__main__":
