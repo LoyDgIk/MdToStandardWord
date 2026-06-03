@@ -678,6 +678,82 @@ class CoverBackendDocxTest(unittest.TestCase):
             if p.find("w:pPr/w:sectPr", self._W_NS) is not None
         ), 4)
 
+    def test_cover_backend_section_titles_match_template_direct_formatting(self):
+        xml = _build_cover_docx_xml(
+            "---\n"
+            "title: 标题格式测试标准\n"
+            "introduction: |\n"
+            "  引言内容。\n"
+            "---\n"
+            "# 范围\n\n"
+            "正文。\n\n"
+            "# 参考文献\n\n"
+            "GB/T 1.1—2020　标准化工作导则\n\n"
+            "# 索引\n\n"
+            "## B\n\n"
+            "- 标准：1\n",
+            kind="group",
+        )
+        root = ET.fromstring(xml)
+
+        title_specs = {
+            "目次": ("360", [("目", "320"), ("次", None)]),
+            "前言": ("360", [("前", "320"), ("言", None)]),
+            "引言": ("360", [("引", "320"), ("言", None)]),
+            "参考文献": ("120", [("参考文", "105"), ("献", None)]),
+            "索引": ("120", [("索", "210"), ("引", None)]),
+        }
+        for title, (after, runs) in title_specs.items():
+            with self.subTest(title=title):
+                paragraph = self._et_paragraph_exact(root, title)
+                self.assertIsNotNone(paragraph)
+                spacing = paragraph.find("w:pPr/w:spacing", self._W_NS)
+                self.assertIsNotNone(spacing)
+                self.assertEqual(spacing.get(self._w_tag("after")), after)
+                actual_runs = paragraph.findall("w:r", self._W_NS)
+                self.assertEqual(
+                    [
+                        (
+                            self._et_text(run),
+                            self._run_spacing(run),
+                        )
+                        for run in actual_runs
+                        if self._et_text(run)
+                    ],
+                    runs,
+                )
+
+    def test_national_cover_backend_section_titles_match_template_spacing(self):
+        xml = _build_cover_docx_xml(
+            "---\n"
+            "standard_type: 国家标准\n"
+            "title: 国家标题格式测试标准\n"
+            "introduction: |\n"
+            "  引言内容。\n"
+            "---\n"
+            "# 范围\n\n"
+            "正文。\n\n"
+            "# 参考文献\n\n"
+            "GB/T 1.1—2020　标准化工作导则\n",
+            kind="national",
+        )
+        root = ET.fromstring(xml)
+
+        toc = self._et_paragraph_exact(root, "目次")
+        preface = self._et_paragraph_exact(root, "前言")
+        references = self._et_paragraph_exact(root, "参考文献")
+        self.assertEqual(
+            toc.find("w:pPr/w:spacing", self._W_NS).get(self._w_tag("after")),
+            "468",
+        )
+        preface_spacing = preface.find("w:pPr/w:spacing", self._W_NS)
+        self.assertEqual(preface_spacing.get(self._w_tag("before")), "900")
+        self.assertEqual(preface_spacing.get(self._w_tag("after")), "468")
+        self.assertEqual(
+            references.find("w:pPr/w:spacing", self._W_NS).get(self._w_tag("after")),
+            "156",
+        )
+
     def test_cover_backend_sections_before_body_appendix_references_and_index(self):
         xml = _build_cover_docx_xml(
             "---\n"
@@ -1030,12 +1106,22 @@ class CoverBackendDocxTest(unittest.TestCase):
                 return paragraph
         return None
 
+    def _et_paragraph_exact(self, root, text: str):
+        for paragraph in root.findall(".//w:p", self._W_NS):
+            if self._et_text(paragraph) == text:
+                return paragraph
+        return None
+
     def _jc_value(self, paragraph) -> str:
         jc = paragraph.find("w:pPr/w:jc", self._W_NS)
         return jc.get(self._w_tag("val")) if jc is not None else ""
 
     def _w_tag(self, name: str) -> str:
         return "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}" + name
+
+    def _run_spacing(self, run) -> str:
+        spacing = run.find("w:rPr/w:spacing", self._W_NS)
+        return spacing.get(self._w_tag("val")) if spacing is not None else None
 
     def _sections(self, document_xml: bytes) -> list:
         root = ET.fromstring(document_xml)

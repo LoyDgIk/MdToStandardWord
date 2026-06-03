@@ -681,6 +681,105 @@ def _new_numbered_style_paragraph(anchor: Paragraph, doc, style_name: str,
     return para
 
 
+def _set_direct_paragraph_spacing(para: Paragraph, before: Optional[int] = None,
+                                  after: Optional[int] = None):
+    """设置模板标题段落保留的直接段距。"""
+    if before is None and after is None:
+        return
+    ppr = para._p.get_or_add_pPr()
+    spacing = ppr.find(qn("w:spacing"))
+    if spacing is None:
+        spacing = OxmlElement("w:spacing")
+        ppr.append(spacing)
+    if before is not None:
+        spacing.set(qn("w:before"), str(before))
+    if after is not None:
+        spacing.set(qn("w:after"), str(after))
+
+
+def _set_run_char_spacing(run, value: int, east_asia_hint: bool = False):
+    rpr = run._r.get_or_add_rPr()
+    if east_asia_hint:
+        rfonts = rpr.find(qn("w:rFonts"))
+        if rfonts is None:
+            rfonts = OxmlElement("w:rFonts")
+            rpr.append(rfonts)
+        rfonts.set(qn("w:hint"), "eastAsia")
+    spacing = rpr.find(qn("w:spacing"))
+    if spacing is None:
+        spacing = OxmlElement("w:spacing")
+        rpr.append(spacing)
+    spacing.set(qn("w:val"), str(value))
+
+
+def _set_run_east_asia_hint(run):
+    rpr = run._r.get_or_add_rPr()
+    rfonts = rpr.find(qn("w:rFonts"))
+    if rfonts is None:
+        rfonts = OxmlElement("w:rFonts")
+        rpr.append(rfonts)
+    rfonts.set(qn("w:hint"), "eastAsia")
+
+
+def _section_title_after(title: str, kind: str) -> Optional[int]:
+    front_titles = {"目次", "前言", "引言"}
+    body_titles = {"参考文献", "索引"}
+    if kind == "national":
+        if title in front_titles:
+            return 468
+        if title in body_titles:
+            return 156
+    else:
+        if title in front_titles:
+            return 360
+        if title in body_titles:
+            return 120
+    return None
+
+
+def _section_title_before(title: str, kind: str) -> Optional[int]:
+    # 国家标准模板的前言首页标题带直接段前距，其他标题不额外设置。
+    if kind == "national" and title == "前言":
+        return 900
+    return None
+
+
+def _section_title_char_spacing(title: str) -> tuple[Optional[int], bool]:
+    if title in {"目次", "前言", "引言"}:
+        return 320, False
+    if title == "参考文献":
+        return 105, True
+    if title == "索引":
+        return 210, True
+    return None, False
+
+
+def _emit_section_title_before(anchor: Paragraph, doc, style_name: str, title: str,
+                               kind: str = "group") -> Paragraph:
+    """输出与模板标题段落一致的节标题。
+
+    模板中的"目次/前言/引言/参考文献/索引"不是单个普通 run：
+    标题前 N-1 个字带字符间距，最后一个字不带字符间距；段距也有直接格式。
+    """
+    para = _new_paragraph_before(anchor, doc, style_name)
+    _set_direct_paragraph_spacing(
+        para,
+        before=_section_title_before(title, kind),
+        after=_section_title_after(title, kind),
+    )
+    char_spacing, east_asia_hint = _section_title_char_spacing(title)
+    if char_spacing is None or len(title) < 2:
+        para.add_run(title)
+        return para
+
+    first = para.add_run(title[:-1])
+    _set_run_char_spacing(first, char_spacing, east_asia_hint=east_asia_hint)
+    last = para.add_run(title[-1])
+    if east_asia_hint:
+        _set_run_east_asia_hint(last)
+    return para
+
+
 def _emit_page_break(anchor: Paragraph, doc) -> Paragraph:
     para = _new_paragraph_before(anchor, doc, S.S_NORMAL)
     para.add_run().add_break(WD_BREAK.PAGE)
@@ -1850,35 +1949,35 @@ def _remove_paragraph(para: Paragraph):
     parent.remove(para._p)
 
 
-def _emit_cover_toc(anchor: Paragraph, doc):
-    _new_paragraph_before(anchor, doc, S.S_TOC_TITLE, text="目次")
+def _emit_cover_toc(anchor: Paragraph, doc, kind: str):
+    _emit_section_title_before(anchor, doc, S.S_TOC_TITLE, "目次", kind=kind)
     _make_toc_field(anchor, doc)
 
 
-def _emit_cover_foreword(anchor: Paragraph, doc, meta: model.Meta):
-    _new_paragraph_before(anchor, doc, S.S_PREFACE_TITLE, text="前言")
+def _emit_cover_foreword(anchor: Paragraph, doc, meta: model.Meta, kind: str):
+    _emit_section_title_before(anchor, doc, S.S_PREFACE_TITLE, "前言", kind=kind)
     _emit_foreword_content(anchor, doc, meta)
 
 
-def _emit_cover_introduction(anchor: Paragraph, doc, meta: model.Meta):
+def _emit_cover_introduction(anchor: Paragraph, doc, meta: model.Meta, kind: str):
     if not meta.introduction.strip():
         return
-    _new_paragraph_before(anchor, doc, S.S_PREFACE_TITLE, text="引言")
+    _emit_section_title_before(anchor, doc, S.S_PREFACE_TITLE, "引言", kind=kind)
     _emit_introduction_content(anchor, doc, meta)
 
 
-def _emit_cover_references(anchor: Paragraph, doc, sdoc: model.StandardDoc):
+def _emit_cover_references(anchor: Paragraph, doc, sdoc: model.StandardDoc, kind: str):
     if not sdoc.references:
         return
-    _new_paragraph_before(anchor, doc, S.S_REF_TITLE, text="参考文献")
+    _emit_section_title_before(anchor, doc, S.S_REF_TITLE, "参考文献", kind=kind)
     for item in sdoc.references:
         _new_paragraph_before(anchor, doc, S.S_REF_ITEM, text=item)
 
 
-def _emit_cover_index(anchor: Paragraph, doc, sdoc: model.StandardDoc):
+def _emit_cover_index(anchor: Paragraph, doc, sdoc: model.StandardDoc, kind: str):
     if not sdoc.index_groups:
         return
-    _new_paragraph_before(anchor, doc, S.S_INDEX_TITLE, text="索引")
+    _emit_section_title_before(anchor, doc, S.S_INDEX_TITLE, "索引", kind=kind)
     for group in sdoc.index_groups:
         _new_paragraph_before(anchor, doc, S.S_INDEX_LETTER, text=group.letter)
         for item in group.items:
@@ -1891,7 +1990,7 @@ def _emit_document_end_line(anchor: Paragraph, doc, image_bytes: bytes):
     para.add_run().add_picture(io.BytesIO(image_bytes))
 
 
-def _emit_cover_sections(doc, sdoc: model.StandardDoc, end_line_image: bytes):
+def _emit_cover_sections(doc, sdoc: model.StandardDoc, end_line_image: bytes, kind: str):
     anchor = doc.add_paragraph()
     refs = _body_page_refs(doc)
     include_even = sdoc.meta.odd_even_pages
@@ -1918,12 +2017,12 @@ def _emit_cover_sections(doc, sdoc: model.StandardDoc, end_line_image: bytes):
         )
         body_started = True
 
-    _emit_cover_toc(anchor, doc)
+    _emit_cover_toc(anchor, doc, kind)
     front_break(start=1)
-    _emit_cover_foreword(anchor, doc, sdoc.meta)
+    _emit_cover_foreword(anchor, doc, sdoc.meta, kind)
     if sdoc.meta.introduction.strip():
         front_break()
-        _emit_cover_introduction(anchor, doc, sdoc.meta)
+        _emit_cover_introduction(anchor, doc, sdoc.meta, kind)
     front_break()
     _emit_body_standard_title(anchor, doc, sdoc.meta)
     _emit_body_blocks(anchor, doc, sdoc.body)
@@ -1939,10 +2038,10 @@ def _emit_cover_sections(doc, sdoc: model.StandardDoc, end_line_image: bytes):
         )
     if sdoc.references:
         body_break(start=1 if not body_started else None)
-        _emit_cover_references(anchor, doc, sdoc)
+        _emit_cover_references(anchor, doc, sdoc, kind)
     if sdoc.index_groups:
         body_break(start=1 if not body_started else None)
-        _emit_cover_index(anchor, doc, sdoc)
+        _emit_cover_index(anchor, doc, sdoc, kind)
     _emit_document_end_line(anchor, doc, end_line_image)
     _configure_final_section(
         doc,
@@ -1973,7 +2072,7 @@ def build_cover(sdoc: model.StandardDoc, output_path: str, kind: str = "auto"):
     _ensure_cover_publisher(doc, sdoc.meta.publisher, cover_info, kind=resolved_kind)
     _cleanup_cover_placeholders(doc)
 
-    _emit_cover_sections(doc, sdoc, end_line_image)
+    _emit_cover_sections(doc, sdoc, end_line_image, resolved_kind)
     _enable_update_fields(doc)
     _set_even_and_odd_headers(doc, sdoc.meta.odd_even_pages)
 
