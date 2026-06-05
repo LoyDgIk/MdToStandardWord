@@ -14,7 +14,7 @@ MdToStandardWord（`md2std`）是用于将 Markdown 标准草稿转换为标准�
 - 支持表格单元格内公式片段、正文公式块，并转换为 Word 原生公式。
 - 支持表、图、公式、规范性引用文件的类型化交叉引用。
 - 支持显式分页符和可选 Word COM 后处理；后处理可更新域、重新分页并按真实分页处理续表。
-- 提供项目内 Codex Skill，用于辅助编写标准 Markdown 和执行转换流程。
+- 模板资产随 `md2std` Python 包一同安装；Codex Skill 在独立仓库维护。
 
 ## 环境要求
 
@@ -27,6 +27,7 @@ MdToStandardWord（`md2std`）是用于将 Markdown 标准草稿转换为标准�
 
 ```powershell
 pip install -r requirements.txt
+pip install -e .
 ```
 
 主要依赖如下：
@@ -35,13 +36,20 @@ pip install -r requirements.txt
 - `markdown-it-py`
 - `PyYAML`
 - `latex2mathml`
+- `lxml`
 
 ## 基本用法
 
-在项目根目录执行：
+安装后可执行：
 
 ```powershell
 python -X utf8 -m md2std examples/地热温泉资源开发利用规范.md -o examples/地热温泉资源开发利用规范.docx
+```
+
+也可使用 console script：
+
+```powershell
+md2std examples/地热温泉资源开发利用规范.md -o examples/地热温泉资源开发利用规范.docx
 ```
 
 生成国家标准文档时，可显式指定标准类型：
@@ -366,12 +374,9 @@ GB/T 1.1—2020　标准化工作导则 第1部分：标准化文件的结构和
 | `examples/地热温泉资源开发利用规范.md` | 团体标准示例，覆盖术语、无标题条、表格、附录、参考文献和索引。 |
 | `examples/汽车、摩托车用车速表.md` | 国家标准示例，覆盖国家标准封面、公式、HTML 表格和交叉引用。 |
 
-项目内还提供 Codex Skill：
+Codex Skill 已拆分为独立仓库。Skill 仓库通过 `scripts/requirements.txt` 固定引用本 CLI 仓库的 release tag，并通过 `scripts/run_md2std.py` 调用 `md2std`。
 
-| 路径 | 用途 |
-| --- | --- |
-| `skills/md2std-standard/SKILL.md` | 说明本项目 Markdown 写作约定与 DOCX 转换流程。 |
-| `skills/md2std-standard/examples/智能井盖运行维护规范.md` | Skill 内部独立示例，不依赖项目根目录示例。 |
+推荐 CLI 仓库发布新 tag 后，再在 Skill 仓库更新对应的 Git 依赖版本。
 
 ## 验证
 
@@ -405,10 +410,9 @@ md2std/
   styles.py           Word 样式映射
   mathconv.py         LaTeX/MathML/OMML 转换
   word_postprocess.py Word COM 后处理
-templates/            封面蓝图与版式资产
+  templates/          封面蓝图与版式资产
 examples/             示例 Markdown 与生成结果
 tests/                自动化测试
-skills/               项目内 Codex Skill
 ```
 
 ## 注意事项

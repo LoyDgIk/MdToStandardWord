@@ -9,27 +9,20 @@ import sys
 
 from . import md_parser
 from . import docx_builder
+from . import resources
 
 # 默认完整模板：template 后端按 kind 选择；_DEFAULT_TEMPLATE 保持团体模板用于旧测试兼容。
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJ_DIR = os.path.dirname(_PKG_DIR)
 
 
 def _resolve_default_template(kind="group"):
     if kind == "national":
-        candidates = [
-            os.path.join(_PROJ_DIR, "templates", "国家标准模板.docx"),
-            os.path.join(_PROJ_DIR, "国家标准.docx"),
-        ]
+        candidates = resources.template_candidates("template_national.docx")
     else:
-        candidates = [
-            os.path.join(_PROJ_DIR, "templates", "团体标准模板.docx"),
-            os.path.join(_PROJ_DIR, "2 团体标准——模板.docx"),
-        ]
+        candidates = resources.template_candidates("template_group.docx")
     for c in candidates:
         if os.path.isfile(c):
             return c
-    return candidates[0]
+    raise FileNotFoundError("找不到默认模板：%s" % kind)
 
 
 def _resolve_kind(kind, meta):

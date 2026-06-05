@@ -27,6 +27,7 @@ from docx.text.paragraph import Paragraph
 
 from . import boilerplate as bp
 from . import model
+from . import resources
 from . import styles as S
 
 
@@ -117,15 +118,14 @@ def _resolve_kind(kind: str, meta: model.Meta) -> str:
 
 def _default_cover_path(kind: str) -> str:
     if kind == "national":
-        return _first_existing_path([
-            os.path.join(_PROJ_DIR, "templates", "cover_national.docx"),
-            os.path.join(_PROJ_DIR, "国家标准.docx"),
-        ], "国家标准封面蓝图")
-    return _first_existing_path([
-        os.path.join(_PROJ_DIR, "templates", "cover_group.docx"),
-        os.path.join(_PROJ_DIR, "2 团体标准——模板.docx"),
-        os.path.join(_PROJ_DIR, "templates", "团体标准模板.docx"),
-    ], "团体标准封面蓝图")
+        return _first_existing_path(
+            resources.template_candidates("cover_national.docx", "template_national.docx"),
+            "国家标准封面蓝图",
+        )
+    return _first_existing_path(
+        resources.template_candidates("cover_group.docx", "template_group.docx"),
+        "团体标准封面蓝图",
+    )
 
 
 def _cover_blueprint_from_source(source_path: str, output_path: str):
@@ -231,11 +231,6 @@ def _configure_standard_styles(doc):
 SEQ_TABLE    = "表"
 SEQ_FIGURE   = "图"
 SEQ_EQUATION = "公式"
-
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJ_DIR = os.path.dirname(_PKG_DIR)
-
-
 
 def _bm_name(anchor_id: str) -> str:
     """把任意 id（可含中文）映射为合法的 Word 书签名。

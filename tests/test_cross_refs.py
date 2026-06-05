@@ -951,14 +951,14 @@ class CoverBackendDocxTest(unittest.TestCase):
 
     def test_cover_backend_uses_cover_blueprint_parts(self):
         parts = _build_cover_docx_parts("# 范围\n\n正文。\n", kind="group")
-        with zipfile.ZipFile(os.path.join("templates", "cover_group.docx")) as zf:
+        with zipfile.ZipFile(docx_builder._default_cover_path("group")) as zf:
             self.assertEqual(self._style_names(parts["styles"]), self._style_names(zf.read("word/styles.xml")))
             self.assertNotEqual(parts["document"], zf.read("word/document.xml"))
 
     def test_cover_backend_end_line_uses_packaged_cover_image(self):
         cases = [
-            ("group", os.path.join("templates", "cover_group.docx"), "word/media/image1.jpeg"),
-            ("national", os.path.join("templates", "cover_national.docx"), "word/media/image3.jpg"),
+            ("group", docx_builder._default_cover_path("group"), "word/media/image1.jpeg"),
+            ("national", docx_builder._default_cover_path("national"), "word/media/image3.jpg"),
         ]
         for kind, cover_path, expected_image in cases:
             with self.subTest(kind=kind):
@@ -1074,13 +1074,13 @@ class CoverBackendDocxTest(unittest.TestCase):
     def test_cover_blueprints_keep_complete_cover_section(self):
         pairs = [
             (self._first_existing_path(
-                os.path.join("templates", "团体标准模板.docx"),
+                cli._resolve_default_template("group"),
                 "2 团体标准——模板.docx",
-            ), os.path.join("templates", "cover_group.docx")),
+            ), docx_builder._default_cover_path("group")),
             (self._first_existing_path(
-                os.path.join("templates", "国家标准模板.docx"),
+                cli._resolve_default_template("national"),
                 "国家标准.docx",
-            ), os.path.join("templates", "cover_national.docx")),
+            ), docx_builder._default_cover_path("national")),
         ]
         for source_path, cover_path in pairs:
             with self.subTest(cover_path=cover_path):
