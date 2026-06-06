@@ -25,6 +25,22 @@ def _build_docx_xml(markdown: str) -> str:
             os.remove(path)
 
 
+def _build_docx_parts(markdown: str) -> dict:
+    sdoc = md_parser.parse(markdown)
+    fd, path = tempfile.mkstemp(suffix=".docx")
+    os.close(fd)
+    try:
+        docx_builder.build(sdoc, cli._DEFAULT_TEMPLATE, path)
+        with zipfile.ZipFile(path) as zf:
+            return {
+                "document": zf.read("word/document.xml"),
+                "numbering": zf.read("word/numbering.xml"),
+            }
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def _build_template_docx_xml(markdown: str, kind: str = "group") -> str:
     sdoc = md_parser.parse(markdown)
     fd, path = tempfile.mkstemp(suffix=".docx")
@@ -511,11 +527,37 @@ class CrossReferenceDocxTest(unittest.TestCase):
         self.assertIsNotNone(top)
         self.assertIsNotNone(nested)
         self.assertIsNotNone(top.find('w:pPr/w:pStyle[@w:val="174"]', self._W_NS))
-        self.assertIsNotNone(top.find('w:pPr/w:numPr/w:numId[@w:val="13"]', self._W_NS))
         self.assertIsNotNone(top.find('w:pPr/w:numPr/w:ilvl[@w:val="0"]', self._W_NS))
         self.assertIsNotNone(nested.find('w:pPr/w:pStyle[@w:val="109"]', self._W_NS))
-        self.assertIsNotNone(nested.find('w:pPr/w:numPr/w:numId[@w:val="13"]', self._W_NS))
         self.assertIsNotNone(nested.find('w:pPr/w:numPr/w:ilvl[@w:val="1"]', self._W_NS))
+        self.assertEqual(self._num_id_value(top), self._num_id_value(nested))
+
+    def test_separate_ordered_lists_restart_numbering(self):
+        parts = _build_docx_parts(
+            "# 范围\n\n"
+            "## 发生异常时\n\n"
+            "1. 停止运行。\n"
+            "2. 设置警戒区域。\n\n"
+            "## 解除异常后\n\n"
+            "1. 自动通风。\n"
+            "2. 恢复确认。\n"
+        )
+        document = ET.fromstring(parts["document"])
+        numbering = ET.fromstring(parts["numbering"])
+        first = self._et_paragraph_containing(document, "停止运行")
+        second = self._et_paragraph_containing(document, "自动通风")
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        first_num_id = self._num_id_value(first)
+        second_num_id = self._num_id_value(second)
+        self.assertNotEqual(first_num_id, second_num_id)
+        for num_id in (first_num_id, second_num_id):
+            restart = numbering.find(
+                f'w:num[@w:numId="{num_id}"]/w:lvlOverride[@w:ilvl="0"]/w:startOverride[@w:val="1"]',
+                self._W_NS,
+            )
+            self.assertIsNotNone(restart)
 
     def _paragraph_containing(self, xml: str, text: str) -> str:
         text_pos = xml.index(text)
@@ -539,6 +581,11 @@ class CrossReferenceDocxTest(unittest.TestCase):
 
     def _et_text(self, element) -> str:
         return "".join(t.text or "" for t in element.findall(".//w:t", self._W_NS))
+
+    def _num_id_value(self, paragraph) -> str:
+        num_id = paragraph.find("w:pPr/w:numPr/w:numId", self._W_NS)
+        self.assertIsNotNone(num_id)
+        return num_id.get(self._w_tag("val"))
 
     def _jc_value(self, paragraph) -> str:
         jc = paragraph.find("w:pPr/w:jc", self._W_NS)

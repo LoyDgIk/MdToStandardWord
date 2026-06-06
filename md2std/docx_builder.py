@@ -88,12 +88,65 @@ def _style_numbering(doc, style_name: str):
     return int(numid.get(qn("w:val"))), int(ilvl.get(qn("w:val")) if ilvl is not None and ilvl.get(qn("w:val")) is not None else 0)
 
 
-def _set_numbering_from_style(para: Paragraph, doc, style_name: str):
+def _abstract_num_id_for_num(doc, num_id: int) -> Optional[int]:
+    """返回 numId 对应的 abstractNumId。"""
+    numbering = doc.part.numbering_part.element
+    for num in numbering.findall(qn("w:num")):
+        if num.get(qn("w:numId")) != str(num_id):
+            continue
+        abstract = num.find(qn("w:abstractNumId"))
+        if abstract is None or abstract.get(qn("w:val")) is None:
+            return None
+        return int(abstract.get(qn("w:val")))
+    return None
+
+
+def _next_numbering_id(doc) -> int:
+    numbering = doc.part.numbering_part.element
+    ids = []
+    for num in numbering.findall(qn("w:num")):
+        val = num.get(qn("w:numId"))
+        if val is not None and val.isdigit():
+            ids.append(int(val))
+    return (max(ids) if ids else 0) + 1
+
+
+def _new_numbering_instance_from_style(doc, style_name: str) -> Optional[int]:
+    """基于模板样式的 abstractNum 新建一个 numId，使独立列表重新编号。"""
+    style_numbering = _style_numbering(doc, style_name)
+    if style_numbering is None:
+        return None
+    base_num_id, _ = style_numbering
+    abstract_num_id = _abstract_num_id_for_num(doc, base_num_id)
+    if abstract_num_id is None:
+        return None
+
+    new_num_id = _next_numbering_id(doc)
+    num = OxmlElement("w:num")
+    num.set(qn("w:numId"), str(new_num_id))
+    abstract = OxmlElement("w:abstractNumId")
+    abstract.set(qn("w:val"), str(abstract_num_id))
+    num.append(abstract)
+    for ilvl in range(9):
+        lvl_override = OxmlElement("w:lvlOverride")
+        lvl_override.set(qn("w:ilvl"), str(ilvl))
+        start_override = OxmlElement("w:startOverride")
+        start_override.set(qn("w:val"), "1")
+        lvl_override.append(start_override)
+        num.append(lvl_override)
+    doc.part.numbering_part.element.append(num)
+    return new_num_id
+
+
+def _set_numbering_from_style(para: Paragraph, doc, style_name: str,
+                              num_id_override: Optional[int] = None):
     """显式套用模板样式的编号定义，避免 Word 忽略样式级列表缩进。"""
     numbering = _style_numbering(doc, style_name)
     if numbering is None:
         return
     num_id, ilvl = numbering
+    if num_id_override is not None:
+        num_id = num_id_override
     _set_numbering(para, num_id, ilvl)
 
 
@@ -670,9 +723,10 @@ def _new_paragraph_before(anchor: Paragraph, doc, style_name: str,
 
 
 def _new_numbered_style_paragraph(anchor: Paragraph, doc, style_name: str,
-                                  text: str = "", spans: Optional[List[model.Span]] = None) -> Paragraph:
+                                  text: str = "", spans: Optional[List[model.Span]] = None,
+                                  num_id_override: Optional[int] = None) -> Paragraph:
     para = _new_paragraph_before(anchor, doc, style_name, text=text, spans=spans)
-    _set_numbering_from_style(para, doc, style_name)
+    _set_numbering_from_style(para, doc, style_name, num_id_override=num_id_override)
     return para
 
 
@@ -1303,7 +1357,7 @@ def _emit_term(anchor: Paragraph, doc, spans):
 
 
 def _emit_body_block(anchor: Paragraph, doc, blk, in_terms=False, in_normrefs=False,
-                     appendix_letter=None):
+                     appendix_letter=None, list_num_id: Optional[int] = None):
     """把一个正文块插入到 anchor 之前。"""
     if isinstance(blk, model.Heading):
         if in_terms and blk.level == 2:
@@ -1342,7 +1396,10 @@ def _emit_body_block(anchor: Paragraph, doc, blk, in_terms=False, in_normrefs=Fa
         else:
             style = S.S_LIST_DASH
         for it in blk.items:
-            _new_numbered_style_paragraph(anchor, doc, style, spans=it.spans)
+            _new_numbered_style_paragraph(
+                anchor, doc, style, spans=it.spans,
+                num_id_override=list_num_id if blk.ordered else None,
+            )
     elif isinstance(blk, model.TableModel):
         _emit_table(anchor, doc, blk, appendix_letter=appendix_letter)
     elif isinstance(blk, model.Figure):
@@ -1703,12 +1760,23 @@ def _emit_body_blocks(anchor: Paragraph, doc, blocks: List[object]):
     blocks = _inject_chapter_boilerplate(blocks)
     in_terms = False
     in_normrefs = False
+    ordered_list_num_id = None
     for blk in blocks:
         if isinstance(blk, model.Heading) and blk.level == 1:
             t = blk.text.strip()
             in_terms = "术语" in t and "定义" in t
             in_normrefs = "规范性引用文件" in t
-        _emit_body_block(anchor, doc, blk, in_terms=in_terms, in_normrefs=in_normrefs)
+        if isinstance(blk, model.ListBlock) and blk.ordered:
+            style = S.ORDERED_LIST_STYLE_BY_LEVEL.get(blk.level, S.S_LIST_NUMBER_3)
+            if blk.level == 1 or ordered_list_num_id is None:
+                ordered_list_num_id = _new_numbering_instance_from_style(doc, style)
+            _emit_body_block(
+                anchor, doc, blk, in_terms=in_terms, in_normrefs=in_normrefs,
+                list_num_id=ordered_list_num_id,
+            )
+        else:
+            _emit_body_block(anchor, doc, blk, in_terms=in_terms, in_normrefs=in_normrefs)
+            ordered_list_num_id = None
 
 
 def _build_body(doc, sdoc: model.StandardDoc):
@@ -1779,12 +1847,24 @@ def _emit_appendices(anchor: Paragraph, doc, appendices: List[model.Appendix],
         _apply_style_run_properties(doc, nature_run, S.S_APPENDIX_NATURE)
         head.add_run().add_break()
         _add_styled_runs(head, doc, S.S_APPENDIX_TITLE, appx.title_spans)
+        ordered_list_num_id = None
         for blk in appx.blocks:
             if isinstance(blk, model.Heading):
                 style = S.APPENDIX_CLAUSE_STYLE_BY_LEVEL.get(blk.level, S.S_PARA)
                 _new_paragraph_before(anchor, doc, style, spans=blk.spans)
+                ordered_list_num_id = None
+            elif isinstance(blk, model.ListBlock) and blk.ordered:
+                style = S.ORDERED_LIST_STYLE_BY_LEVEL.get(blk.level, S.S_LIST_NUMBER_3)
+                if blk.level == 1 or ordered_list_num_id is None:
+                    ordered_list_num_id = _new_numbering_instance_from_style(doc, style)
+                _emit_body_block(
+                    anchor, doc, blk,
+                    appendix_letter=letter,
+                    list_num_id=ordered_list_num_id,
+                )
             else:
                 _emit_body_block(anchor, doc, blk, appendix_letter=letter)
+                ordered_list_num_id = None
 
 
 def _clear_template_appendix_placeholders(doc):
