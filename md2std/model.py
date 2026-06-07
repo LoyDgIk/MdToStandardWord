@@ -20,6 +20,14 @@ class Span:
     text: str
     bold: bool = False
     italic: bool = False
+    subscript: bool = False
+    superscript: bool = False
+
+
+@dataclass
+class FormulaSpan(Span):
+    """行内公式片段，text 保存 LaTeX 源码。"""
+    pass
 
 
 @dataclass
@@ -32,9 +40,12 @@ class RefSpan(Span):
 
 @dataclass
 class TableCellPart:
-    """表格单元格内片段。kind=text/formula，formula 使用 LaTeX 源码。"""
+    """表格单元格内片段。kind=text/formula/ref，formula 使用 LaTeX 源码。"""
     kind: str
     text: str = ""
+    ref_type: str = ""
+    target: str = ""
+    mode: str = "num"
 
 
 # --------------------------------------------------------------------------- #

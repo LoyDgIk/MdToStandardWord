@@ -39,6 +39,7 @@ def split_front_matter(text: str) -> Tuple[dict, str]:
 _FORMULA_LINE_RE = re.compile(
     r"^[ \t]*\$\$(.+?)\$\$[ \t]*(?:\{#([^}]+)\})?[ \t]*$", re.M)
 _FORMULA_PLACEHOLDER_RE = re.compile(r"^\s*\[\[\[MD2STD-FORMULA-(\d+)\]\]\]\s*$")
+_INLINE_FORMULA_RE = re.compile(r"\$\$(.+?)\$\$")
 # 类型化锚点 {#tbl:id} / {#fig:id} / {#eq:id}
 _ANCHOR_RE = re.compile(r"\{#([^}\s]+)\}")
 _LEGACY_REF_RE = re.compile(r"\{@[^}]+\}")
@@ -142,21 +143,101 @@ def _parse_ref_token(token: str, bold: bool = False, italic: bool = False) -> mo
 def _split_reference_spans(spans: List[model.Span]) -> List[model.Span]:
     out: List[model.Span] = []
     for sp in spans:
+        if isinstance(sp, model.FormulaSpan):
+            out.append(sp)
+            continue
         pos = 0
         for m in _INLINE_REF_TOKEN_RE.finditer(sp.text):
             if m.start() > pos:
                 chunk = sp.text[pos:m.start()]
                 if "{{" in chunk or "}}" in chunk or "{@" in chunk:
                     raise ValueError("无效交叉引用语法：%s。" % chunk)
-                out.append(model.Span(chunk, sp.bold, sp.italic))
+                out.append(model.Span(chunk, sp.bold, sp.italic, sp.subscript, sp.superscript))
             out.append(_parse_ref_token(m.group(0), sp.bold, sp.italic))
             pos = m.end()
         if pos < len(sp.text):
             tail = sp.text[pos:]
             if "{{" in tail or "}}" in tail or "{@" in tail:
                 raise ValueError("无效交叉引用语法：%s。" % tail)
-            out.append(model.Span(tail, sp.bold, sp.italic))
+            out.append(model.Span(tail, sp.bold, sp.italic, sp.subscript, sp.superscript))
     return out
+
+
+def _append_inline_text_spans(
+    spans: List[model.Span],
+    text: str,
+    *,
+    bold: bool = False,
+    italic: bool = False,
+    subscript: bool = False,
+    superscript: bool = False,
+):
+    """Split inline formulas and Typora/Obsidian-style ^sup^/~sub~ markers into spans."""
+    if not text:
+        return
+    pos = 0
+    for m in _INLINE_FORMULA_RE.finditer(text):
+        if m.start() > pos:
+            _append_script_text_spans(
+                spans,
+                text[pos:m.start()],
+                bold=bold,
+                italic=italic,
+                subscript=subscript,
+                superscript=superscript,
+            )
+        latex = (m.group(1) or "").strip()
+        if latex:
+            _assert_clean_formula(latex, "行内公式")
+            spans.append(model.FormulaSpan(latex, bold=bold, italic=italic))
+        pos = m.end()
+    if pos < len(text):
+        _append_script_text_spans(
+            spans,
+            text[pos:],
+            bold=bold,
+            italic=italic,
+            subscript=subscript,
+            superscript=superscript,
+        )
+
+
+def _append_script_text_spans(
+    spans: List[model.Span],
+    text: str,
+    *,
+    bold: bool = False,
+    italic: bool = False,
+    subscript: bool = False,
+    superscript: bool = False,
+):
+    if not text:
+        return
+    pos = 0
+    i = 0
+    while i < len(text):
+        marker = text[i]
+        if marker not in ("^", "~"):
+            i += 1
+            continue
+        j = text.find(marker, i + 1)
+        if j <= i + 1:
+            i += 1
+            continue
+        if i > pos:
+            spans.append(model.Span(text[pos:i], bold, italic, subscript, superscript))
+        marked = text[i + 1:j]
+        spans.append(model.Span(
+            marked,
+            bold,
+            italic,
+            subscript or marker == "~",
+            superscript or marker == "^",
+        ))
+        i = j + 1
+        pos = i
+    if pos < len(text):
+        spans.append(model.Span(text[pos:], bold, italic, subscript, superscript))
 
 
 def extract_formulas(md: str):
@@ -231,6 +312,8 @@ def _inline_to_spans(inline_token) -> List[model.Span]:
     spans: List[model.Span] = []
     bold = 0
     italic = 0
+    subscript = 0
+    superscript = 0
     for ch in (inline_token.children or []):
         t = ch.type
         if t == "strong_open":
@@ -241,20 +324,59 @@ def _inline_to_spans(inline_token) -> List[model.Span]:
             italic += 1
         elif t == "em_close":
             italic = max(0, italic - 1)
+        elif t == "html_inline":
+            content = (ch.content or "").strip().lower()
+            if content.startswith("<sub"):
+                subscript += 1
+            elif content.startswith("</sub"):
+                subscript = max(0, subscript - 1)
+            elif content.startswith("<sup"):
+                superscript += 1
+            elif content.startswith("</sup"):
+                superscript = max(0, superscript - 1)
         elif t in ("text", "code_inline"):
             if ch.content:
-                spans.append(model.Span(ch.content, bold=bold > 0, italic=italic > 0))
+                _append_inline_text_spans(
+                    spans,
+                    ch.content,
+                    bold=bold > 0,
+                    italic=italic > 0,
+                    subscript=subscript > 0,
+                    superscript=superscript > 0,
+                )
         elif t == "softbreak":
             # 段内软换行：中文文本直接连接
             pass
         elif t == "hardbreak":
-            spans.append(model.Span("\n", bold=bold > 0, italic=italic > 0))
+            spans.append(model.Span(
+                "\n",
+                bold=bold > 0,
+                italic=italic > 0,
+                subscript=subscript > 0,
+                superscript=superscript > 0,
+            ))
         # image / link 文本由其它路径处理
     # 合并相邻同格式片段
     merged: List[model.Span] = []
     for sp in spans:
-        if merged and merged[-1].bold == sp.bold and merged[-1].italic == sp.italic:
-            merged[-1] = model.Span(merged[-1].text + sp.text, sp.bold, sp.italic)
+        if isinstance(sp, model.FormulaSpan):
+            merged.append(sp)
+            continue
+        if (
+            merged
+            and not isinstance(merged[-1], model.FormulaSpan)
+            and merged[-1].bold == sp.bold
+            and merged[-1].italic == sp.italic
+            and merged[-1].subscript == sp.subscript
+            and merged[-1].superscript == sp.superscript
+        ):
+            merged[-1] = model.Span(
+                merged[-1].text + sp.text,
+                sp.bold,
+                sp.italic,
+                sp.subscript,
+                sp.superscript,
+            )
         else:
             merged.append(sp)
     return _split_reference_spans(merged)
@@ -457,6 +579,32 @@ def _parse_table_cell_parts(text: str) -> List[model.TableCellPart]:
 def _append_text_part(parts: List[model.TableCellPart], text: str):
     if not text:
         return
+    pos = 0
+    for m in _INLINE_REF_TOKEN_RE.finditer(text):
+        if m.start() > pos:
+            chunk = text[pos:m.start()]
+            if "{{" in chunk or "}}" in chunk or "{@" in chunk:
+                raise ValueError("无效交叉引用语法：%s。" % chunk)
+            _append_plain_text_part(parts, chunk)
+        ref = _parse_ref_token(m.group(0))
+        parts.append(model.TableCellPart(
+            "ref",
+            ref.text,
+            ref_type=ref.ref_type,
+            target=ref.target,
+            mode=ref.mode,
+        ))
+        pos = m.end()
+    if pos < len(text):
+        tail = text[pos:]
+        if "{{" in tail or "}}" in tail or "{@" in tail:
+            raise ValueError("无效交叉引用语法：%s。" % tail)
+        _append_plain_text_part(parts, tail)
+
+
+def _append_plain_text_part(parts: List[model.TableCellPart], text: str):
+    if not text:
+        return
     if parts and parts[-1].kind == "text":
         parts[-1].text += text
     else:
@@ -480,6 +628,17 @@ def _table_parts_text(parts: List[model.TableCellPart]) -> str:
     for part in parts:
         if part.kind == "formula":
             out.append(_formula_display_text(part.text))
+        elif part.kind == "ref":
+            if part.ref_type == "std":
+                out.append(part.target)
+            elif part.ref_type == "eq" and part.mode in ("label", "full"):
+                out.append("式（?）")
+            elif part.ref_type == "tbl":
+                out.append("表?")
+            elif part.ref_type == "fig":
+                out.append("图?")
+            else:
+                out.append("?")
         else:
             out.append(part.text)
     return "".join(out).strip()
@@ -820,10 +979,13 @@ def _strip_leading(spans, n):
         if remaining <= 0:
             out.append(sp)
             continue
+        if isinstance(sp, model.FormulaSpan):
+            out.append(sp)
+            continue
         if len(sp.text) <= remaining:
             remaining -= len(sp.text)
             continue
-        out.append(model.Span(sp.text[remaining:], sp.bold, sp.italic))
+        out.append(model.Span(sp.text[remaining:], sp.bold, sp.italic, sp.subscript, sp.superscript))
         remaining = 0
     return out
 
@@ -835,6 +997,21 @@ def _iter_block_spans(blk):
     elif isinstance(blk, model.ListBlock):
         for item in blk.items:
             yield from item.spans
+    elif isinstance(blk, model.TableModel):
+        part_rows = []
+        if blk.header_parts:
+            part_rows.append(blk.header_parts)
+        part_rows.extend(blk.row_parts or [])
+        for row in part_rows:
+            for cell_parts in row:
+                for part in cell_parts:
+                    if part.kind == "ref":
+                        yield model.RefSpan(
+                            text=part.text,
+                            ref_type=part.ref_type,
+                            target=part.target,
+                            mode=part.mode,
+                        )
 
 
 def _collect_normative_refs(doc: model.StandardDoc):

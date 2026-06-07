@@ -656,11 +656,19 @@ def _fix_numbering_style_indent(doc, style_name, left_twips, hanging_twips):
 
 def _set_runs(paragraph: Paragraph, spans: List[model.Span]):
     """按 spans 给段落添加 run（加粗/斜体）；RefSpan 转换为 REF 域。"""
+    from . import mathconv
     if not spans:
         return
     for sp in spans:
         if isinstance(sp, model.RefSpan):
             _add_typed_ref(paragraph, sp)
+            continue
+        if isinstance(sp, model.FormulaSpan):
+            omath = mathconv.latex_to_omml(sp.text)
+            if omath is not None:
+                paragraph._p.append(omath)
+            else:
+                paragraph.add_run(sp.text)
             continue
         for i, piece in enumerate(sp.text.split("\n")):
             if i > 0:
@@ -671,6 +679,10 @@ def _set_runs(paragraph: Paragraph, spans: List[model.Span]):
                     r.bold = True
                 if sp.italic:
                     r.italic = True
+                if getattr(sp, "subscript", False):
+                    r.font.subscript = True
+                if getattr(sp, "superscript", False):
+                    r.font.superscript = True
 
 
 def _apply_style_run_properties(doc, run, style_name: str):
@@ -689,9 +701,18 @@ def _apply_style_run_properties(doc, run, style_name: str):
 
 
 def _add_styled_runs(paragraph: Paragraph, doc, style_name: str, spans: List[model.Span]):
+    from . import mathconv
     for sp in spans:
         if isinstance(sp, model.RefSpan):
             _add_typed_ref(paragraph, sp)
+            continue
+        if isinstance(sp, model.FormulaSpan):
+            omath = mathconv.latex_to_omml(sp.text)
+            if omath is not None:
+                paragraph._p.append(omath)
+            else:
+                run = paragraph.add_run(sp.text)
+                _apply_style_run_properties(doc, run, style_name)
             continue
         for i, piece in enumerate(sp.text.split("\n")):
             if i > 0:
@@ -703,6 +724,10 @@ def _add_styled_runs(paragraph: Paragraph, doc, style_name: str, spans: List[mod
                     run.bold = True
                 if sp.italic:
                     run.italic = True
+                if getattr(sp, "subscript", False):
+                    run.font.subscript = True
+                if getattr(sp, "superscript", False):
+                    run.font.superscript = True
 
 
 def _new_paragraph_before(anchor: Paragraph, doc, style_name: str,
@@ -1597,6 +1622,14 @@ def _emit_table_cell_parts(paragraph: Paragraph, parts: List[model.TableCellPart
     if not parts:
         return
     for part in parts:
+        if part.kind == "ref":
+            _add_typed_ref(paragraph, model.RefSpan(
+                text=part.text,
+                ref_type=part.ref_type,
+                target=part.target,
+                mode=part.mode,
+            ))
+            continue
         if part.kind == "formula":
             omath = mathconv.latex_to_omml(part.text)
             if omath is not None:

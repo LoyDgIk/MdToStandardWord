@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import unittest
+import unittest.mock as mock
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -110,6 +111,32 @@ class CrossReferenceParserTest(unittest.TestCase):
         self.assertEqual(ref.target, "classify")
         self.assertEqual(ref.mode, "label")
         self.assertEqual(table.anchor_id, "classify")
+
+    def test_extended_markdown_subscript_and_superscript_render(self):
+        doc = md_parser.parse("# 范围\n\nH~2~O 的 2^10^ 倍，T<sub>r</sub> 与 m<sup>3</sup>。\n")
+        paragraph = next(b for b in doc.body if isinstance(b, model.Paragraph))
+
+        subscript_text = "".join(s.text for s in paragraph.spans if s.subscript)
+        superscript_text = "".join(s.text for s in paragraph.spans if s.superscript)
+
+        self.assertEqual(subscript_text, "2r")
+        self.assertEqual(superscript_text, "103")
+
+        xml = _build_docx_xml("# 范围\n\nH~2~O 的 2^10^ 倍。\n")
+        self.assertIn('<w:vertAlign w:val="subscript"', xml)
+        self.assertIn('<w:vertAlign w:val="superscript"', xml)
+
+    def test_inline_double_dollar_formula_renders_as_omml(self):
+        doc = md_parser.parse("# 范围\n\n变量 $$T_r$$ 与 $$Q_e$$ 应统一说明。\n")
+        paragraph = next(b for b in doc.body if isinstance(b, model.Paragraph))
+        formulas = [s for s in paragraph.spans if isinstance(s, model.FormulaSpan)]
+
+        self.assertEqual([s.text for s in formulas], ["T_r", "Q_e"])
+
+        xml = _build_docx_xml("# 范围\n\n变量 $$T_r$$ 与 H~2~O。\n")
+        self.assertIn("<m:oMath", xml)
+        self.assertNotIn("$$T_r$$", xml)
+        self.assertIn('<w:vertAlign w:val="subscript"', xml)
 
     def test_legacy_reference_syntax_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "旧交叉引用语法"):
@@ -1277,8 +1304,8 @@ class CliPostprocessTest(unittest.TestCase):
             with open(input_path, "w", encoding="utf-8") as f:
                 f.write("# 范围\n\n正文。\n")
 
-            with unittest.mock.patch("md2std.docx_builder.build_cover", return_value=output_path), \
-                 unittest.mock.patch("md2std.word_postprocess.postprocess_with_word_com", return_value=output_path) as post:
+            with mock.patch("md2std.docx_builder.build_cover", return_value=output_path), \
+                 mock.patch("md2std.word_postprocess.postprocess_with_word_com", return_value=output_path) as post:
                 self.assertEqual(cli.main([input_path, "-o", output_path]), 0)
                 post.assert_not_called()
 
@@ -1309,7 +1336,7 @@ class CliPostprocessTest(unittest.TestCase):
                 with open(work_path, "wb") as f:
                     f.write(b"processed")
 
-            with unittest.mock.patch("md2std.word_postprocess._postprocess_document", fake_process):
+            with mock.patch("md2std.word_postprocess._postprocess_document", fake_process):
                 word_postprocess._postprocess_with_word_instance(
                     os.path.abspath(target),
                     word,
@@ -1339,7 +1366,7 @@ class CliPostprocessTest(unittest.TestCase):
                     f.write(b"partial")
                 raise RuntimeError("boom")
 
-            with unittest.mock.patch("md2std.word_postprocess._postprocess_document", fake_process):
+            with mock.patch("md2std.word_postprocess._postprocess_document", fake_process):
                 with self.assertRaisesRegex(RuntimeError, "boom"):
                     word_postprocess._postprocess_with_word_instance(
                         os.path.abspath(target),
