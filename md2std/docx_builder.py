@@ -1207,6 +1207,15 @@ def _set_even_and_odd_headers(doc, enabled: bool):
         settings.remove(old)
 
 
+def _normalize_cover_page_number_for_odd_even_export(doc, enabled: bool):
+    if not enabled or not doc.sections:
+        return
+    # Word's PDF export inserts a blank page between an unnumbered cover and a
+    # front-matter section that restarts at roman I when odd/even pages are on.
+    # Starting the hidden cover section at 0 keeps the TOC on the next physical page.
+    _set_section_page_number(doc.sections[0]._sectPr, start=0)
+
+
 def _set_section_form_protection(sectpr, protected: bool):
     form_prot = sectpr.find(qn("w:formProt"))
     if protected:
@@ -2397,6 +2406,7 @@ def build_cover(
     _emit_cover_sections(doc, sdoc, end_line_image, resolved_kind)
     _enable_update_fields(doc)
     _set_even_and_odd_headers(doc, sdoc.meta.odd_even_pages)
+    _normalize_cover_page_number_for_odd_even_export(doc, sdoc.meta.odd_even_pages)
     if _should_enable_cover_form_protection(sdoc.meta, cover_form_protection):
         _enable_cover_form_field_protection(doc)
     else:
@@ -2435,6 +2445,7 @@ def build(
     _build_toc(doc)
     _enable_update_fields(doc)
     _set_even_and_odd_headers(doc, sdoc.meta.odd_even_pages)
+    _normalize_cover_page_number_for_odd_even_export(doc, sdoc.meta.odd_even_pages)
     if _should_enable_cover_form_protection(sdoc.meta, cover_form_protection):
         _enable_cover_form_field_protection(doc)
     else:

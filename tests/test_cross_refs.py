@@ -954,6 +954,8 @@ class CoverBackendDocxTest(unittest.TestCase):
 
         self.assertIsNone(default_settings.find("w:evenAndOddHeaders", self._W_NS))
         self.assertIsNotNone(enabled_settings.find("w:evenAndOddHeaders", self._W_NS))
+        self.assertEqual(self._pg_num(enabled_sections[0]), ("", "0"))
+        self.assertEqual(self._pg_num(enabled_sections[1]), ("upperRoman", "1"))
         refs = self._section_refs(enabled_sections[1])
         self.assertIn(("headerReference", "even"), refs)
         self.assertIn(("footerReference", "even"), refs)
