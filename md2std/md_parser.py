@@ -774,6 +774,13 @@ def _example_has_inline_content(example: model.Example) -> bool:
     return _EXAMPLE_RE.sub("", text, count=1).strip() != ""
 
 
+def _marker_content_start(text: str, marker_end: int) -> int:
+    pos = marker_end
+    while pos < len(text) and text[pos].isspace():
+        pos += 1
+    return pos
+
+
 def parse(text: str) -> model.StandardDoc:
     data, body_md = split_front_matter(text)
     doc = model.StandardDoc(meta=build_meta(data))
@@ -914,10 +921,18 @@ def _make_block(kind, blk, table_caption):
             return model.PageBreak()
         m = _NOTE_RE.match(ptext)
         if m:
-            return model.Note(spans=spans, index=int(m.group(1)) if m.group(1) else None)
+            content_spans = _strip_leading(spans, _marker_content_start(ptext, m.end()))
+            return model.Note(
+                spans=content_spans,
+                index=int(m.group(1)) if m.group(1) else None,
+            )
         m = _EXAMPLE_RE.match(ptext)
         if m:
-            return model.Example(spans=spans, index=int(m.group(1)) if m.group(1) else None)
+            content_spans = _strip_leading(spans, _marker_content_start(ptext, m.end()))
+            return model.Example(
+                spans=content_spans,
+                index=int(m.group(1)) if m.group(1) else None,
+            )
         if _SOURCE_RE.match(ptext):
             return model.Source(text=ptext.strip())
         m = _UNTITLED_RE.match(ptext)

@@ -138,6 +138,20 @@ class CrossReferenceParserTest(unittest.TestCase):
         self.assertNotIn("$$T_r$$", xml)
         self.assertIn('<w:vertAlign w:val="subscript"', xml)
 
+    def test_note_and_example_markers_are_not_kept_in_content_spans(self):
+        doc = md_parser.parse("# 范围\n\n注：温度分级用于初判。\n\n示例1：按代表性温度判定。\n")
+        note = next(b for b in doc.body if isinstance(b, model.Note))
+        example = next(b for b in doc.body if isinstance(b, model.Example))
+
+        self.assertEqual("".join(s.text for s in note.spans), "温度分级用于初判。")
+        self.assertIsNone(note.index)
+        self.assertEqual("".join(s.text for s in example.spans), "按代表性温度判定。")
+        self.assertEqual(example.index, 1)
+
+        xml = _build_docx_xml("# 范围\n\n注：温度分级用于初判。\n")
+        self.assertIn(">温度分级用于初判。<", xml)
+        self.assertNotIn(">注：温度分级用于初判。<", xml)
+
     def test_legacy_reference_syntax_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "旧交叉引用语法"):
             md_parser.parse("# 范围\n\n按式（{@eq-depth:a}）计算。")
