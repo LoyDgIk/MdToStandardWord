@@ -78,6 +78,16 @@ def _build_cover_docx_parts(markdown: str, kind: str = "group") -> dict:
             return {
                 "document": zf.read("word/document.xml"),
                 "rels": zf.read("word/_rels/document.xml.rels"),
+                "headers": {
+                    name: zf.read(name)
+                    for name in zf.namelist()
+                    if name.startswith("word/header") and name.endswith(".xml")
+                },
+                "footers": {
+                    name: zf.read(name)
+                    for name in zf.namelist()
+                    if name.startswith("word/footer") and name.endswith(".xml")
+                },
                 "media": {
                     name: zf.read(name)
                     for name in zf.namelist()
@@ -226,17 +236,30 @@ class CrossReferenceParserTest(unittest.TestCase):
         paragraph = next(b for b in doc.body if isinstance(b, model.Paragraph))
         self.assertEqual(paragraph.text, "4.2.1  开发地热温泉资源前，应完成地质勘查。")
 
-    def test_odd_even_pages_metadata_defaults_false_and_parses_true(self):
+    def test_metadata_defaults_and_cover_options_parse(self):
         default_doc = md_parser.parse("# 范围\n\n正文。\n")
         enabled_doc = md_parser.parse(
             "---\n"
             "odd_even_pages: true\n"
+            "cover_form_protection: true\n"
+            "draft_version: 征求意见稿\n"
+            "---\n\n"
+            "# 范围\n\n正文。\n"
+        )
+        chinese_key_doc = md_parser.parse(
+            "---\n"
+            "草案版次: 报批稿\n"
             "---\n\n"
             "# 范围\n\n正文。\n"
         )
 
         self.assertFalse(default_doc.meta.odd_even_pages)
+        self.assertFalse(default_doc.meta.cover_form_protection)
+        self.assertEqual(default_doc.meta.draft_version, "")
         self.assertTrue(enabled_doc.meta.odd_even_pages)
+        self.assertTrue(enabled_doc.meta.cover_form_protection)
+        self.assertEqual(enabled_doc.meta.draft_version, "征求意见稿")
+        self.assertEqual(chinese_key_doc.meta.draft_version, "报批稿")
 
     def test_page_break_markers_parse_as_body_blocks(self):
         doc = md_parser.parse(
@@ -935,6 +958,58 @@ class CoverBackendDocxTest(unittest.TestCase):
         self.assertIn(("headerReference", "even"), refs)
         self.assertIn(("footerReference", "even"), refs)
 
+    def test_cover_backend_odd_even_headers_and_footers_use_standard_styles(self):
+        for kind, expected in (
+            ("group", {
+                "odd_header": "标准文件_页眉奇数页",
+                "even_header": "标准文件_页眉偶数页",
+                "odd_footer": "标准文件_页脚奇数页",
+                "even_footer": "标准文件_页脚偶数页",
+            }),
+            ("national", {
+                "odd_header": "标准文件_页眉奇数页",
+                "even_header": "标准文件_页眉偶数页",
+                "odd_footer": "标准文件_页脚奇数页",
+                "even_footer": "标准文件_页脚偶数页",
+            }),
+        ):
+            with self.subTest(kind=kind):
+                parts = _build_cover_docx_parts(
+                    "---\n"
+                    "odd_even_pages: true\n"
+                    "---\n\n"
+                    "# 范围\n\n正文。\n",
+                    kind=kind,
+                )
+                sections = self._sections(parts["document"])
+                targets = self._section_ref_targets(parts["rels"], sections[1])
+
+                odd_header = "word/" + targets[("headerReference", "default")]
+                even_header = "word/" + targets[("headerReference", "even")]
+                odd_footer = "word/" + targets[("footerReference", "default")]
+                even_footer = "word/" + targets[("footerReference", "even")]
+
+                self.assertEqual(
+                    self._first_paragraph_style_name(parts["styles"], parts["headers"][odd_header]),
+                    expected["odd_header"],
+                )
+                self.assertEqual(
+                    self._first_paragraph_style_name(parts["styles"], parts["headers"][even_header]),
+                    expected["even_header"],
+                )
+                self.assertEqual(
+                    self._first_paragraph_style_name(parts["styles"], parts["footers"][odd_footer]),
+                    expected["odd_footer"],
+                )
+                self.assertEqual(
+                    self._first_paragraph_style_name(parts["styles"], parts["footers"][even_footer]),
+                    expected["even_footer"],
+                )
+                self.assertEqual(self._first_paragraph_direct_jc(parts["headers"][odd_header]), "")
+                self.assertEqual(self._first_paragraph_direct_jc(parts["headers"][even_header]), "")
+                self.assertEqual(self._first_paragraph_direct_jc(parts["footers"][odd_footer]), "")
+                self.assertEqual(self._first_paragraph_direct_jc(parts["footers"][even_footer]), "")
+
     def test_cover_backend_tunes_dash_and_reference_numbering_indents(self):
         parts = _build_cover_docx_parts(
             "# 范围\n\n"
@@ -1042,6 +1117,62 @@ class CoverBackendDocxTest(unittest.TestCase):
         with zipfile.ZipFile(docx_builder._default_cover_path("group")) as zf:
             self.assertEqual(self._style_names(parts["styles"]), self._style_names(zf.read("word/styles.xml")))
             self.assertNotEqual(parts["document"], zf.read("word/document.xml"))
+
+    def test_cover_backend_preserves_legacy_form_dropdowns_without_default_protection(self):
+        for kind in ("group", "national"):
+            with self.subTest(kind=kind):
+                parts = _build_cover_docx_parts("# 范围\n\n正文。\n", kind=kind)
+                dropdown_fields = self._legacy_dropdown_fields(parts["document"])
+                protection = self._document_protection(parts["settings"])
+                sections = self._sections(parts["document"])
+
+                self.assertIn(b"FORMDROPDOWN", parts["document"])
+                self.assertIn(b"<w:ddList", parts["document"])
+                self.assertEqual(protection.get("edit"), "forms")
+                self.assertEqual(protection.get("enforcement"), "0")
+                for section in sections:
+                    self.assertEqual(self._section_form_prot(section), "0")
+                self.assertEqual(len(dropdown_fields), 2)
+                self.assertEqual(dropdown_fields[0]["name"], "下拉1")
+                self.assertEqual(dropdown_fields[0]["result"], "1")
+                self.assertEqual(dropdown_fields[0]["selected"], "草案版次选择")
+                self.assertEqual(dropdown_fields[0]["entries"][0], " ")
+                self.assertIn("草案版次选择", dropdown_fields[0]["entries"])
+                self.assertEqual(dropdown_fields[1]["name"], "下拉2")
+                self.assertEqual(dropdown_fields[1]["result"], "1")
+                self.assertEqual(dropdown_fields[1]["entries"][0], " ")
+                self.assertIn("在提交反馈意见时，请将您知道的相关专利连同支持性文件一并附上。", dropdown_fields[1]["entries"])
+
+    def test_cover_backend_metadata_enables_cover_form_protection(self):
+        parts = _build_cover_docx_parts(
+            "---\n"
+            "cover_form_protection: true\n"
+            "---\n\n"
+            "# 范围\n\n正文。\n"
+        )
+        protection = self._document_protection(parts["settings"])
+        sections = self._sections(parts["document"])
+
+        self.assertEqual(protection.get("edit"), "forms")
+        self.assertEqual(protection.get("enforcement"), "1")
+        self.assertNotIn("hash", protection)
+        self.assertNotIn("salt", protection)
+        self.assertEqual(self._section_form_prot(sections[0]), "")
+        for section in sections[1:]:
+            self.assertEqual(self._section_form_prot(section), "0")
+
+    def test_cover_backend_metadata_sets_draft_version_dropdown(self):
+        parts = _build_cover_docx_parts(
+            "---\n"
+            "draft_version: 征求意见稿\n"
+            "---\n\n"
+            "# 范围\n\n正文。\n"
+        )
+        dropdown_fields = self._legacy_dropdown_fields(parts["document"])
+
+        self.assertEqual(dropdown_fields[0]["name"], "下拉1")
+        self.assertEqual(dropdown_fields[0]["result"], "3")
+        self.assertEqual(dropdown_fields[0]["selected"], "（征求意见稿）")
 
     def test_cover_backend_end_line_uses_packaged_cover_image(self):
         cases = [
@@ -1238,6 +1369,79 @@ class CoverBackendDocxTest(unittest.TestCase):
                 refs.add((local, child.get(self._w_tag("type"))))
         return refs
 
+    def _section_ref_targets(self, rels_xml: bytes, section) -> dict:
+        rels_root = ET.fromstring(rels_xml)
+        rels_ns = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+        rel_targets = {
+            rel.get("Id"): rel.get("Target")
+            for rel in rels_root.findall("r:Relationship", rels_ns)
+        }
+        targets = {}
+        for child in section:
+            local = child.tag.rsplit("}", 1)[-1]
+            if local not in ("headerReference", "footerReference"):
+                continue
+            rel_id = child.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+            targets[(local, child.get(self._w_tag("type")))] = rel_targets[rel_id]
+        return targets
+
+    def _first_paragraph_style_name(self, styles_xml: bytes, part_xml: bytes) -> str:
+        styles_root = ET.fromstring(styles_xml)
+        style_names = {}
+        for style in styles_root.findall(".//w:style", self._W_NS):
+            name = style.find("w:name", self._W_NS)
+            if name is not None:
+                style_names[style.get(self._w_tag("styleId"))] = name.get(self._w_tag("val"))
+
+        part_root = ET.fromstring(part_xml)
+        pstyle = part_root.find(".//w:p/w:pPr/w:pStyle", self._W_NS)
+        self.assertIsNotNone(pstyle)
+        return style_names[pstyle.get(self._w_tag("val"))]
+
+    def _first_paragraph_direct_jc(self, part_xml: bytes) -> str:
+        part_root = ET.fromstring(part_xml)
+        jc = part_root.find(".//w:p/w:pPr/w:jc", self._W_NS)
+        return jc.get(self._w_tag("val")) if jc is not None else ""
+
+    def _legacy_dropdown_fields(self, document_xml: bytes) -> list:
+        root = ET.fromstring(document_xml)
+        fields = []
+        for fld_char in root.findall(".//w:fldChar", self._W_NS):
+            ffdata = fld_char.find("w:ffData", self._W_NS)
+            if ffdata is None:
+                continue
+            ddlist = ffdata.find("w:ddList", self._W_NS)
+            if ddlist is None:
+                continue
+            name = ffdata.find("w:name", self._W_NS)
+            result = ddlist.find("w:result", self._W_NS)
+            entries = [
+                item.get(self._w_tag("val"))
+                for item in ddlist.findall("w:listEntry", self._W_NS)
+            ]
+            raw_result = result.get(self._w_tag("val")) if result is not None else ""
+            selected_index = int(raw_result) if raw_result.isdigit() else -1
+            fields.append({
+                "name": name.get(self._w_tag("val")) if name is not None else "",
+                "result": raw_result,
+                "selected": entries[selected_index] if 0 <= selected_index < len(entries) else "",
+                "entries": entries,
+            })
+        return fields
+
+    def _document_protection(self, settings_xml: bytes) -> dict:
+        root = ET.fromstring(settings_xml)
+        protection = root.find(".//w:documentProtection", self._W_NS)
+        self.assertIsNotNone(protection)
+        return {
+            key.rsplit("}", 1)[-1]: value
+            for key, value in protection.attrib.items()
+        }
+
+    def _section_form_prot(self, section) -> str:
+        form_prot = section.find("w:formProt", self._W_NS)
+        return form_prot.get(self._w_tag("val")) if form_prot is not None else ""
+
     def _numbering_ind_by_style(self, numbering_xml: bytes, style_id: str) -> dict:
         root = ET.fromstring(numbering_xml)
         for lvl in root.findall(".//w:lvl", self._W_NS):
@@ -1311,6 +1515,28 @@ class CoverBackendDocxTest(unittest.TestCase):
 
 
 class CliPostprocessTest(unittest.TestCase):
+    def test_cover_form_protection_flag_is_forwarded_and_can_override_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_path = os.path.join(td, "input.md")
+            output_path = os.path.join(td, "output.docx")
+            with open(input_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "---\n"
+                    "cover_form_protection: true\n"
+                    "---\n\n"
+                    "# 范围\n\n正文。\n"
+                )
+
+            with mock.patch("md2std.docx_builder.build_cover", return_value=output_path) as build_cover:
+                self.assertEqual(cli.main([input_path, "-o", output_path]), 0)
+                self.assertIsNone(build_cover.call_args.kwargs["cover_form_protection"])
+
+                self.assertEqual(cli.main([input_path, "-o", output_path, "--cover-form-protection"]), 0)
+                self.assertTrue(build_cover.call_args.kwargs["cover_form_protection"])
+
+                self.assertEqual(cli.main([input_path, "-o", output_path, "--no-cover-form-protection"]), 0)
+                self.assertFalse(build_cover.call_args.kwargs["cover_form_protection"])
+
     def test_word_com_postprocess_is_called_only_when_flag_is_enabled(self):
         with tempfile.TemporaryDirectory() as td:
             input_path = os.path.join(td, "input.md")

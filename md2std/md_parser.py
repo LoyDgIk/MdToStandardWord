@@ -294,6 +294,7 @@ def build_meta(data: dict) -> model.Meta:
         replaces=s("replaces"),
         title=s("title"),
         title_en=s("title_en"),
+        draft_version=s("draft_version") or s("draft_stage") or s("草案版次"),
         ics=s("ics"),
         ccs=s("ccs"),
         publish_date=s("publish_date"),
@@ -302,6 +303,7 @@ def build_meta(data: dict) -> model.Meta:
         foreword=fw,
         introduction=s("introduction"),
         odd_even_pages=_as_bool(data.get("odd_even_pages", False)),
+        cover_form_protection=_as_bool(data.get("cover_form_protection", False)),
     )
 
 

@@ -24,6 +24,10 @@ S_INDEX_TITLE = "标准文件_索引标题"       # 索引
 S_INDEX_LETTER = "标准文件_索引字母"      # A/B/C...
 S_INDEX_ITEM = "标准文件_索引项"          # 术语 + 点引导 + 位置列表
 S_BODY_STANDARD_NAME = "标准文件_正文标准名称"  # 正文首页标准名称标题
+S_HEADER_ODD = "标准文件_页眉奇数页"
+S_HEADER_EVEN = "标准文件_页眉偶数页"
+S_FOOTER_ODD = "标准文件_页脚奇数页"
+S_FOOTER_EVEN = "标准文件_页脚偶数页"
 
 # --- 正文章条标题（level 1..6） ----------------------------------------------
 S_CHAPTER = "标准文件_章标题"            # 1  范围

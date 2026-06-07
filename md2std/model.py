@@ -267,6 +267,7 @@ class Meta:
     replaces: str = ""
     title: str = ""
     title_en: str = ""
+    draft_version: str = ""
     ics: str = ""
     ccs: str = ""
     publish_date: str = ""
@@ -275,6 +276,7 @@ class Meta:
     foreword: Foreword = field(default_factory=Foreword)
     introduction: str = ""
     odd_even_pages: bool = False
+    cover_form_protection: bool = False
 
 
 # --------------------------------------------------------------------------- #

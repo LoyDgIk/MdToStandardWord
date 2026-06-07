@@ -82,6 +82,8 @@ md2std input.md -o output.docx --word-com-postprocess
 | `--backend {cover,template}` | 生成后端；默认 `cover`。 |
 | `-t, --template` | `template` 后端使用的完整模板 `.docx` 路径。 |
 | `--word-com-postprocess`, `--word-com` | 调用本机 Microsoft Word COM 更新域、重新分页并保存。 |
+| `--cover-form-protection` | 启用封面旧式 `FORMDROPDOWN` 表单域保护；仅保护封面节，正文节保持可编辑。 |
+| `--no-cover-form-protection` | 关闭封面表单域保护；用于覆盖 YAML 中的 `cover_form_protection: true`。 |
 
 生成后的文档首次在 Word 中打开时，如提示是否更新域，应选择更新。未启用 Word COM 后处理时，也可在 Word 中全选正文后按 `F9` 更新域。
 
@@ -95,11 +97,14 @@ standard_type: 团体标准
 number: T/XXXX XXX-XXXX
 title: 标准中文名称
 title_en: English title
+draft_version: （征求意见稿）
 ics: "27.010"
 ccs: D10
 publish_date: XXXX-XX-XX
 implement_date: XXXX-XX-XX
 publisher: 发布单位
+odd_even_pages: false
+cover_form_protection: false
 foreword:
   patent_note: true
   proposer: 提出单位
@@ -112,6 +117,8 @@ introduction: |
   引言内容。
 ---
 ```
+
+封面草案版次可通过 `draft_version` 固定到旧式下拉框“下拉1”，常用值包括 `草案版次选择`、`（工作组讨论稿）`、`（征求意见稿）`、`（送审讨论稿）`、`（送审稿）`、`（报批稿）`；也可写不带括号的简称，如 `征求意见稿`。`cover_form_protection: true` 与命令行 `--cover-form-protection` 等效；命令行显式传入 `--cover-form-protection` 或 `--no-cover-form-protection` 时优先于 YAML。
 
 正文建议按标准章节顺序编写：
 

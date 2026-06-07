@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "md2std"
-version = "0.1.0"
+version = "0.1.1"
 description = "Convert Chinese standard Markdown documents to standard Word DOCX files."
 readme = "README.md"
 requires-python = ">=3.9"

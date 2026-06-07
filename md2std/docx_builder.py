@@ -905,14 +905,110 @@ def _rel_blob(rel) -> str:
         return ""
 
 
+def _doc_style_names_by_id(doc) -> dict:
+    return {
+        getattr(style, "style_id", ""): getattr(style, "name", "")
+        for style in doc.styles
+        if getattr(style, "style_id", "")
+    }
+
+
+def _part_paragraph_style_names(part, style_names_by_id: dict) -> List[str]:
+    names = []
+    element = getattr(part, "element", None)
+    if element is None:
+        return names
+    for paragraph in element.iter(qn("w:p")):
+        ppr = paragraph.find(qn("w:pPr"))
+        if ppr is None:
+            continue
+        pstyle = ppr.find(qn("w:pStyle"))
+        if pstyle is None:
+            continue
+        style_id = pstyle.get(qn("w:val"))
+        if style_id:
+            names.append(style_names_by_id.get(style_id, style_id))
+    return names
+
+
+def _style_id_by_name(doc, style_name: str) -> Optional[str]:
+    try:
+        return doc.styles[style_name].style_id
+    except KeyError:
+        return None
+
+
+def _set_part_paragraph_style(part, style_id: Optional[str]):
+    if not style_id:
+        return
+    element = getattr(part, "element", None)
+    if element is None:
+        return
+    for paragraph in element.iter(qn("w:p")):
+        ppr = paragraph.find(qn("w:pPr"))
+        if ppr is None:
+            ppr = OxmlElement("w:pPr")
+            paragraph.insert(0, ppr)
+        pstyle = ppr.find(qn("w:pStyle"))
+        if pstyle is None:
+            pstyle = OxmlElement("w:pStyle")
+            ppr.insert(0, pstyle)
+        pstyle.set(qn("w:val"), style_id)
+        # Let the applied standard header/footer style control alignment.
+        # Some blueprint parts keep direct <w:jc w:val="right"/>, which
+        # overrides the even-page header style until the style is reapplied in Word.
+        for tag in ("w:jc",):
+            old = ppr.find(qn(tag))
+            if old is not None:
+                ppr.remove(old)
+
+
+def _choose_odd_even_rels(items, style_names_by_id: dict, odd_marker: str, even_marker: str):
+    """Return (odd_rid, even_rid), preferring explicit standard odd/even styles."""
+    if not items:
+        return None, None
+    odd = None
+    even = None
+    for item in items:
+        names = _part_paragraph_style_names(item[1].target_part, style_names_by_id)
+        if odd is None and any(odd_marker in name for name in names):
+            odd = item
+        if even is None and any(even_marker in name for name in names):
+            even = item
+    if odd is None:
+        odd = items[0]
+    if even is None:
+        even = next((item for item in items if item is not odd), odd)
+    return odd[0], even[0]
+
+
+def _normalize_body_page_ref_styles(doc, refs: dict):
+    style_map = {
+        "header_default": _style_id_by_name(doc, S.S_HEADER_ODD),
+        "header_even": _style_id_by_name(doc, S.S_HEADER_EVEN),
+        "footer_default": _style_id_by_name(doc, S.S_FOOTER_ODD),
+        "footer_even": _style_id_by_name(doc, S.S_FOOTER_EVEN),
+    }
+    applied_rids = set()
+    for key, style_id in style_map.items():
+        rid = refs.get(key)
+        if not rid or rid not in doc.part.rels:
+            continue
+        if rid in applied_rids:
+            continue
+        _set_part_paragraph_style(doc.part.rels[rid].target_part, style_id)
+        applied_rids.add(rid)
+
+
 def _body_page_refs(doc):
     """查找封面蓝图中已打包的正文页眉/页脚关系。"""
     styleref_headers = []
     page_footers = []
+    style_names_by_id = _doc_style_names_by_id(doc)
     for rid, rel in doc.part.rels.items():
         reltype = rel.reltype.rsplit("/", 1)[-1]
         blob = _rel_blob(rel)
-        if reltype == "header" and "STYLEREF" in blob and "标准文件_文件编号" in blob:
+        if reltype == "header" and "STYLEREF" in blob:
             styleref_headers.append((rid, rel))
         elif reltype == "footer" and "PAGE" in blob:
             page_footers.append((rid, rel))
@@ -920,16 +1016,20 @@ def _body_page_refs(doc):
     styleref_headers.sort(key=lambda item: _rel_target_number(item[1]))
     page_footers.sort(key=lambda item: _rel_target_number(item[1]))
 
-    header_default = styleref_headers[0][0] if styleref_headers else None
-    header_even = styleref_headers[1][0] if len(styleref_headers) > 1 else header_default
-    footer_default = page_footers[-1][0] if page_footers else None
-    footer_even = page_footers[-2][0] if len(page_footers) > 1 else footer_default
-    return {
+    header_default, header_even = _choose_odd_even_rels(
+        styleref_headers, style_names_by_id, "页眉奇数页", "页眉偶数页"
+    )
+    footer_default, footer_even = _choose_odd_even_rels(
+        page_footers, style_names_by_id, "页脚奇数页", "页脚偶数页"
+    )
+    refs = {
         "header_default": header_default,
         "header_even": header_even,
         "footer_default": footer_default,
         "footer_even": footer_even,
     }
+    _normalize_body_page_ref_styles(doc, refs)
+    return refs
 
 
 def _configure_section(sectpr, refs: Optional[dict] = None,
@@ -1107,6 +1207,113 @@ def _set_even_and_odd_headers(doc, enabled: bool):
         settings.remove(old)
 
 
+def _set_section_form_protection(sectpr, protected: bool):
+    form_prot = sectpr.find(qn("w:formProt"))
+    if protected:
+        if form_prot is not None:
+            sectpr.remove(form_prot)
+        return
+    if form_prot is None:
+        form_prot = OxmlElement("w:formProt")
+        sectpr.append(form_prot)
+    form_prot.set(qn("w:val"), "0")
+
+
+def _enable_cover_form_field_protection(doc):
+    """Activate legacy form fields on the cover while keeping later sections editable."""
+    settings = doc.settings.element
+    protection = settings.find(qn("w:documentProtection"))
+    if protection is None:
+        protection = OxmlElement("w:documentProtection")
+        settings.append(protection)
+    for attr in list(protection.attrib):
+        del protection.attrib[attr]
+    protection.set(qn("w:edit"), "forms")
+    protection.set(qn("w:enforcement"), "1")
+
+    for idx, section in enumerate(doc.sections):
+        _set_section_form_protection(section._sectPr, protected=(idx == 0))
+
+
+def _disable_form_field_protection(doc):
+    settings = doc.settings.element
+    protection = settings.find(qn("w:documentProtection"))
+    if protection is not None:
+        for attr in list(protection.attrib):
+            del protection.attrib[attr]
+        protection.set(qn("w:edit"), "forms")
+        protection.set(qn("w:enforcement"), "0")
+    for section in doc.sections:
+        _set_section_form_protection(section._sectPr, protected=False)
+
+
+def _should_enable_cover_form_protection(
+    meta: model.Meta,
+    cover_form_protection: Optional[bool],
+) -> bool:
+    if cover_form_protection is not None:
+        return bool(cover_form_protection)
+    return bool(getattr(meta, "cover_form_protection", False))
+
+
+def _legacy_dropdown_field_info(begin_run_el):
+    fld = begin_run_el.find(qn("w:fldChar"))
+    if fld is None:
+        return None
+    ffdata = fld.find(qn("w:ffData"))
+    if ffdata is None:
+        return None
+    name_el = ffdata.find(qn("w:name"))
+    ddlist = ffdata.find(qn("w:ddList"))
+    if name_el is None or ddlist is None:
+        return None
+    return name_el.get(qn("w:val"), ""), ddlist
+
+
+def _normalize_draft_version(value: str) -> str:
+    text = (value or "").strip()
+    aliases = {
+        "工作组讨论稿": "（工作组讨论稿）",
+        "征求意见稿": "（征求意见稿）",
+        "送审讨论稿": "（送审讨论稿）",
+        "送审稿": "（送审稿）",
+        "报批稿": "（报批稿）",
+    }
+    return aliases.get(text, text)
+
+
+def _set_legacy_dropdown_value(doc, field_name: str, value: str) -> bool:
+    selected = _normalize_draft_version(value)
+    if not selected:
+        return False
+    for run_el in doc.element.iter(qn("w:r")):
+        fld = run_el.find(qn("w:fldChar"))
+        if fld is None or fld.get(qn("w:fldCharType")) != "begin":
+            continue
+        info = _legacy_dropdown_field_info(run_el)
+        if info is None:
+            continue
+        name, ddlist = info
+        if name != field_name:
+            continue
+
+        entries = ddlist.findall(qn("w:listEntry"))
+        values = [entry.get(qn("w:val"), "") for entry in entries]
+        if selected not in values:
+            entry = OxmlElement("w:listEntry")
+            entry.set(qn("w:val"), selected)
+            ddlist.append(entry)
+            values.append(selected)
+        idx = values.index(selected)
+        result = ddlist.find(qn("w:result"))
+        if result is None:
+            result = OxmlElement("w:result")
+            ddlist.insert(0, result)
+        result.set(qn("w:val"), str(idx))
+        return True
+    return False
+
+
 # --------------------------------------------------------------------------- #
 # 各节构建
 # --------------------------------------------------------------------------- #
@@ -1148,6 +1355,8 @@ def _apply_cover_fields(doc, meta: model.Meta, kind: Optional[str] = None):
         _set_field_or_placeholder(doc, S.S_COVER_NAME_EN, meta.title_en, [
             r"^点击此处添加标准名称的英文译名$",
         ])
+    if meta.draft_version:
+        _set_legacy_dropdown_value(doc, "下拉1", meta.draft_version)
     if meta.publish_date:
         _set_field_or_placeholder(doc, S.S_COVER_PUBLISH, "%s发布" % meta.publish_date, [
             r"^XXXX\s*-\s*XX\s*-\s*XX发布$",
@@ -2163,7 +2372,12 @@ def _emit_cover_sections(doc, sdoc: model.StandardDoc, end_line_image: bytes, ki
 # --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
-def build_cover(sdoc: model.StandardDoc, output_path: str, kind: str = "auto"):
+def build_cover(
+    sdoc: model.StandardDoc,
+    output_path: str,
+    kind: str = "auto",
+    cover_form_protection: Optional[bool] = None,
+):
     """封面蓝图后端：以封面蓝图为基底，正文全部由代码顺序生成。"""
     _reset_counters()
 
@@ -2183,12 +2397,22 @@ def build_cover(sdoc: model.StandardDoc, output_path: str, kind: str = "auto"):
     _emit_cover_sections(doc, sdoc, end_line_image, resolved_kind)
     _enable_update_fields(doc)
     _set_even_and_odd_headers(doc, sdoc.meta.odd_even_pages)
+    if _should_enable_cover_form_protection(sdoc.meta, cover_form_protection):
+        _enable_cover_form_field_protection(doc)
+    else:
+        _disable_form_field_protection(doc)
 
     doc.save(output_path)
     return output_path
 
 
-def build(sdoc: model.StandardDoc, template_path: str, output_path: str, kind: str = "auto"):
+def build(
+    sdoc: model.StandardDoc,
+    template_path: str,
+    output_path: str,
+    kind: str = "auto",
+    cover_form_protection: Optional[bool] = None,
+):
     _reset_counters()
 
     # 复制模板再打开，避免改动原模板
@@ -2211,6 +2435,10 @@ def build(sdoc: model.StandardDoc, template_path: str, output_path: str, kind: s
     _build_toc(doc)
     _enable_update_fields(doc)
     _set_even_and_odd_headers(doc, sdoc.meta.odd_even_pages)
+    if _should_enable_cover_form_protection(sdoc.meta, cover_form_protection):
+        _enable_cover_form_field_protection(doc)
+    else:
+        _disable_form_field_protection(doc)
 
     doc.save(output_path)
     return output_path

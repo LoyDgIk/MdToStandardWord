@@ -54,6 +54,12 @@ def main(argv=None):
                         help="template 后端使用的完整模板 .docx 路径（默认按 kind 自动选择）")
     parser.add_argument("--word-com-postprocess", "--word-com", action="store_true",
                         help="生成后调用本机 Microsoft Word COM 更新域、重新分页并保存（默认不启用）")
+    parser.add_argument("--cover-form-protection", dest="cover_form_protection",
+                        action="store_true", default=None,
+                        help="启用封面旧式 FORMDROPDOWN 表单域保护，仅保护封面节，正文节保持可编辑")
+    parser.add_argument("--no-cover-form-protection", dest="cover_form_protection",
+                        action="store_false",
+                        help="关闭封面表单域保护；用于覆盖 YAML 中的 cover_form_protection: true")
     args = parser.parse_args(argv)
 
     if not os.path.isfile(args.input):
@@ -73,9 +79,20 @@ def main(argv=None):
         template_path = args.template or _resolve_default_template(resolved_kind)
         if not os.path.isfile(template_path):
             parser.error("找不到模板文件：%s" % template_path)
-        docx_builder.build(sdoc, template_path, output, kind=resolved_kind)
+        docx_builder.build(
+            sdoc,
+            template_path,
+            output,
+            kind=resolved_kind,
+            cover_form_protection=args.cover_form_protection,
+        )
     else:
-        docx_builder.build_cover(sdoc, output, kind=args.kind)
+        docx_builder.build_cover(
+            sdoc,
+            output,
+            kind=args.kind,
+            cover_form_protection=args.cover_form_protection,
+        )
     if args.word_com_postprocess:
         from . import word_postprocess
         try:
