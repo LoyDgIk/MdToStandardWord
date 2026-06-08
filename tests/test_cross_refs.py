@@ -194,9 +194,9 @@ class CrossReferenceParserTest(unittest.TestCase):
         doc = md_parser.parse(
             "# 范围\n\n"
             "{表：#tbl:speed} 测试车速\n\n"
-            "<table><tr><td>最高设计车速（<eq>v_{\\text{max}}</eq>）</td>"
+            "<table><tr><td>最高设计车速（$$v_{\\text{max}}$$）</td>"
             "<td>测试车速</td></tr>"
-            "<tr><td><eq>v_{\\text{max}}</eq>≤45</td><td>80%</td></tr>"
+            "<tr><td>$$v_{\\text{max}}$$≤45</td><td>80%</td></tr>"
             "<tr><td colspan=\"2\">注：按临近分度线取值。</td></tr></table>"
         )
 
@@ -330,7 +330,7 @@ class CrossReferenceParserTest(unittest.TestCase):
             "{表：#tbl:sample} 表题\n\n"
             "| 项目 |\n"
             "| --- |\n"
-            "| 段内容〔注：见{{tbl:sample:label}}。〕〔注：保留**强调**内容。〕 |\n"
+            "| 段内容〔注：见{{tbl:sample:label}}，变量为$$v_{\\text{max}}$$。〕〔注：保留**强调**内容。〕 |\n"
         )
 
         table = next(b for b in doc.body if isinstance(b, model.TableModel))
@@ -339,8 +339,9 @@ class CrossReferenceParserTest(unittest.TestCase):
 
         self.assertEqual(table.rows[0][0], "段内容")
         self.assertEqual(len(note_parts), 2)
-        self.assertEqual("".join(s.text for s in note_parts[0].spans), "见{{tbl:sample:label}}。")
+        self.assertEqual("".join(s.text for s in note_parts[0].spans), "见{{tbl:sample:label}}，变量为v_{\\text{max}}。")
         self.assertTrue(any(isinstance(s, model.RefSpan) for s in note_parts[0].spans))
+        self.assertTrue(any(isinstance(s, model.FormulaSpan) for s in note_parts[0].spans))
         self.assertEqual("".join(s.text for s in note_parts[1].spans), "保留强调内容。")
         self.assertEqual("".join(s.text for s in note_parts[1].spans if s.bold), "强调")
 
@@ -1068,11 +1069,12 @@ class CrossReferenceDocxTest(unittest.TestCase):
         parts = _build_cover_docx_parts(
             "# 范围\n\n"
             "{表：#tbl:single-note} 单注表\n\n"
-            "<table><tr><td colspan=\"2\">段（可包含要求型条款）〔注：单条注的内容〕</td></tr></table>\n"
+            "<table><tr><td colspan=\"2\">段（可包含要求型条款）〔注：单条注含变量$$v_{\\text{max}}$$。〕</td></tr></table>\n"
         )
         root = ET.fromstring(parts["document"])
         body_para = self._et_paragraph_containing(root, "段（可包含要求型条款）")
-        note_para = self._et_paragraph_containing(root, "单条注的内容")
+        note_para = self._et_paragraph_containing(root, "单条注含变量")
+        xml = parts["document"].decode("utf-8", errors="ignore")
 
         self.assertEqual(
             self._paragraph_style(body_para),
@@ -1082,6 +1084,8 @@ class CrossReferenceDocxTest(unittest.TestCase):
             self._paragraph_style(note_para),
             self._style_id_by_name(parts["styles"], "标准文件_注："),
         )
+        self.assertIn("<m:oMath", xml)
+        self.assertNotIn("v_{\\text{max}}", xml)
         self.assertIsNone(note_para.find("w:pPr/w:numPr", self._W_NS))
         self.assertEqual(self._ind_value(body_para, "firstLine"), "199")
         self.assertEqual(self._ind_value(body_para, "firstLineChars"), "95")
@@ -2013,8 +2017,8 @@ class CoverBackendDocxTest(unittest.TestCase):
         xml = _build_docx_xml(
             "# 范围\n\n"
             "{表：#tbl:speed} 测试车速\n\n"
-            "<table><tr><td>最高设计车速（<eq>v_{\\text{max}}</eq>）</td><td>测试车速</td></tr>"
-            "<tr><td><eq>v_{\\text{max}}</eq>≤45</td><td>80%<eq>v_{\\text{max}}</eq></td></tr>"
+            "<table><tr><td>最高设计车速（$$v_{\\text{max}}$$）</td><td>测试车速</td></tr>"
+            "<tr><td>$$v_{\\text{max}}$$≤45</td><td>80%$$v_{\\text{max}}$$</td></tr>"
             "<tr><td colspan=\"2\">注：按临近分度线取值。</td></tr></table>"
         )
 

@@ -42,6 +42,8 @@ _FORMULA_LINE_RE = re.compile(
     r"^[ \t]*\$\$(.+?)\$\$[ \t]*(?:\{#([^}]+)\})?[ \t]*$", re.M)
 _FORMULA_PLACEHOLDER_RE = re.compile(r"^\s*\[\[\[MD2STD-FORMULA-(\d+)\]\]\]\s*$")
 _INLINE_FORMULA_RE = re.compile(r"\$\$(.+?)\$\$")
+_EQ_INLINE_OPEN_RE = re.compile(r"^<eq(?:\s[^>]*)?>$", re.I)
+_EQ_INLINE_CLOSE_RE = re.compile(r"^</eq\s*>$", re.I)
 # 类型化锚点 {#tbl:id} / {#fig:id} / {#eq:id}
 _ANCHOR_RE = re.compile(r"\{#([^}\s]+)\}")
 _LEGACY_REF_RE = re.compile(r"\{@[^}]+\}")
@@ -322,8 +324,31 @@ def _inline_to_spans(inline_token) -> List[model.Span]:
     italic = 0
     subscript = 0
     superscript = 0
+    eq_buffer: Optional[List[str]] = None
+    eq_bold = False
+    eq_italic = False
     for ch in (inline_token.children or []):
         t = ch.type
+        if t == "html_inline":
+            raw_html = (ch.content or "").strip()
+            if _EQ_INLINE_OPEN_RE.match(raw_html):
+                eq_buffer = []
+                eq_bold = bold > 0
+                eq_italic = italic > 0
+                continue
+            if _EQ_INLINE_CLOSE_RE.match(raw_html):
+                latex = "".join(eq_buffer or []).strip()
+                if latex:
+                    _assert_clean_formula(latex, "行内公式")
+                    spans.append(model.FormulaSpan(latex, bold=eq_bold, italic=eq_italic))
+                eq_buffer = None
+                continue
+        if eq_buffer is not None:
+            if t in ("text", "code_inline", "html_inline"):
+                eq_buffer.append(ch.content or "")
+            elif t in ("softbreak", "hardbreak"):
+                eq_buffer.append("\n")
+            continue
         if t == "strong_open":
             bold += 1
         elif t == "strong_close":
@@ -364,6 +389,8 @@ def _inline_to_spans(inline_token) -> List[model.Span]:
                 superscript=superscript > 0,
             ))
         # image / link 文本由其它路径处理
+    if eq_buffer is not None:
+        raise ValueError("行内公式 <eq> 缺少结束标签。")
     # 合并相邻同格式片段
     merged: List[model.Span] = []
     for sp in spans:
@@ -594,7 +621,7 @@ def _parse_table(tokens, start):
     )
 
 
-_TABLE_CELL_PART_RE = re.compile(r"(<eq>(.*?)</eq>|\$([^$]+)\$)", re.S | re.I)
+_TABLE_CELL_PART_RE = re.compile(r"(<eq>(.*?)</eq>|\$\$(.*?)\$\$|\$([^$]+)\$)", re.S | re.I)
 _TABLE_CELL_INLINE_TOKEN_RE = re.compile(r"(\{\{[^{}]+\}\}|\{@[^}]+\}|〔\s*脚注\s*〕|\{脚注[A-Za-z]*\})")
 _FOOTNOTE_REF_TOKEN_RE = re.compile(r"^〔\s*脚注\s*〕$")
 _OLD_FOOTNOTE_REF_TOKEN_RE = re.compile(r"^\{脚注[A-Za-z]*\}$")
@@ -684,7 +711,7 @@ def _append_cell_body_parts(parts: List[model.TableCellPart], text: str):
     for m in _TABLE_CELL_PART_RE.finditer(text or ""):
         if m.start() > pos:
             _append_text_part(parts, _normalize_html_cell_text(text[pos:m.start()]))
-        formula = (m.group(2) if m.group(2) is not None else m.group(3) or "").strip()
+        formula = next((g for g in m.groups()[1:] if g is not None), "").strip()
         if formula:
             parts.append(model.TableCellPart("formula", formula))
         pos = m.end()
