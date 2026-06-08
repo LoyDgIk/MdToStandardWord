@@ -294,14 +294,18 @@ def build_meta(data: dict) -> model.Meta:
         replaces=s("replaces"),
         title=s("title"),
         title_en=s("title_en"),
+        consistency_degree=s("consistency_degree") or s("consistency"),
         draft_version=s("draft_version") or s("draft_stage") or s("草案版次"),
         ics=s("ics"),
         ccs=s("ccs"),
+        record_number=s("record_number") or s("filing_number") or s("备案号"),
         publish_date=s("publish_date"),
         implement_date=s("implement_date"),
         publisher=s("publisher"),
         foreword=fw,
         introduction=s("introduction"),
+        important_notice=s("important_notice") or s("重要提示"),
+        symbols_lead=s("symbols_lead"),
         odd_even_pages=_as_bool(data.get("odd_even_pages", False)),
         cover_form_protection=_as_bool(data.get("cover_form_protection", False)),
     )
@@ -757,6 +761,8 @@ def _parse_html_table_block(content: str):
 _NOTE_RE = re.compile(r"^\s*注\s*(\d+)?\s*[:：]")
 _EXAMPLE_RE = re.compile(r"^\s*示例\s*(\d+)?\s*[:：]")
 _SOURCE_RE = re.compile(r"^\s*\[?\s*来源\s*[:：]")
+_TERM_MARKER_RE = re.compile(r"^\s*\{\s*术语\s*[:：]\s*(.+?)\s*\}\s*$")
+_TERM_SPLIT_RE = re.compile(r"^(.*?)(?:\s*[|｜]\s*|[\s　]{2,})(.+)$")
 _TABLE_CAP_RE = re.compile(r"^\s*\{\s*表\s*[:：]\s*#([^}\s]+)\s*\}\s+(.+?)\s*$")
 _TABLE_CAP_MARKER_RE = re.compile(r"^\s*(?:\{\s*)?表\s*[:：]")
 # 无标题条：显式声明编号层级，不手写具体编号。
@@ -909,8 +915,89 @@ def parse(text: str) -> model.StandardDoc:
             _route_index(doc, cur_index_group, kind, blk)
         idx += 1
 
+    _normalize_terms(doc)
     _validate_refs(doc)
     return doc
+
+
+def _parse_term_title(text: str):
+    value = (text or "").strip()
+    m = _TERM_SPLIT_RE.match(value)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return value, ""
+
+
+def _term_marker_text(blk) -> str:
+    if not isinstance(blk, model.Paragraph):
+        return ""
+    m = _TERM_MARKER_RE.match(_spans_text(blk.spans).strip())
+    return m.group(1).strip() if m else ""
+
+
+def _term_from_start_block(blk) -> model.Term:
+    if isinstance(blk, model.Heading) and blk.level == 2:
+        term, term_en = _parse_term_title(blk.text)
+        return model.Term(term=term, term_en=term_en)
+    marker = _term_marker_text(blk)
+    if marker:
+        term, term_en = _parse_term_title(marker)
+        return model.Term(term=term, term_en=term_en)
+    return None
+
+
+def _is_term_boundary(blk) -> bool:
+    if isinstance(blk, model.Heading) and blk.level <= 2:
+        return True
+    return bool(_term_marker_text(blk))
+
+
+def _consume_term_blocks(body: List[object], start: int):
+    term = _term_from_start_block(body[start])
+    if term is None:
+        return None, start
+    i = start + 1
+    while i < len(body):
+        blk = body[i]
+        if _is_term_boundary(blk):
+            break
+        if isinstance(blk, model.Paragraph) and not term.definition:
+            term.definition = blk.spans
+            i += 1
+            continue
+        if isinstance(blk, model.Note):
+            term.notes.append(blk)
+            i += 1
+            continue
+        if isinstance(blk, model.Source) and term.source is None:
+            term.source = blk
+            i += 1
+            continue
+        break
+    return term, i
+
+
+def _normalize_terms(doc: model.StandardDoc):
+    """把术语章内的术语标题/显式术语标记归一成 model.Term。"""
+    out: List[object] = []
+    in_terms = False
+    i = 0
+    while i < len(doc.body):
+        blk = doc.body[i]
+        if isinstance(blk, model.Heading) and blk.level == 1:
+            in_terms = blk.text.strip() == "术语和定义"
+            out.append(blk)
+            i += 1
+            continue
+        if in_terms:
+            term, next_i = _consume_term_blocks(doc.body, i)
+            if term is not None:
+                out.append(term)
+                i = next_i
+                continue
+        out.append(blk)
+        i += 1
+    doc.body = out
 
 
 def _make_block(kind, blk, table_caption):
@@ -1011,6 +1098,10 @@ def _iter_block_spans(blk):
     if isinstance(blk, (model.Heading, model.Paragraph, model.UntitledClause,
                         model.Note, model.Example, model.ExampleContent)):
         yield from blk.spans
+    elif isinstance(blk, model.Term):
+        yield from blk.definition
+        for note in blk.notes:
+            yield from note.spans
     elif isinstance(blk, model.ListBlock):
         for item in blk.items:
             yield from item.spans

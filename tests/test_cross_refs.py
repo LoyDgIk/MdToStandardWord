@@ -136,6 +136,25 @@ class CrossReferenceParserTest(unittest.TestCase):
         self.assertIn('<w:vertAlign w:val="subscript"', xml)
         self.assertIn('<w:vertAlign w:val="superscript"', xml)
 
+    def test_explicit_term_marker_normalizes_to_term_model(self):
+        doc = md_parser.parse(
+            "# 术语和定义\n\n"
+            "{术语：地热温泉 | geothermal hot spring}\n\n"
+            "出水温度不低于25 ℃的地下热水。\n\n"
+            "注：用于资源开发利用语境。\n\n"
+            "[来源：GB/T 11615—2010，3.1，有修改]\n"
+        )
+
+        term = next(b for b in doc.body if isinstance(b, model.Term))
+
+        self.assertEqual(term.term, "地热温泉")
+        self.assertEqual(term.term_en, "geothermal hot spring")
+        self.assertEqual("".join(s.text for s in term.definition), "出水温度不低于25 ℃的地下热水。")
+        self.assertEqual(len(term.notes), 1)
+        self.assertEqual("".join(s.text for s in term.notes[0].spans), "用于资源开发利用语境。")
+        self.assertIsNotNone(term.source)
+        self.assertEqual(term.source.text, "[来源：GB/T 11615—2010，3.1，有修改]")
+
     def test_inline_double_dollar_formula_renders_as_omml(self):
         doc = md_parser.parse("# 范围\n\n变量 $$T_r$$ 与 $$Q_e$$ 应统一说明。\n")
         paragraph = next(b for b in doc.body if isinstance(b, model.Paragraph))
@@ -243,6 +262,10 @@ class CrossReferenceParserTest(unittest.TestCase):
             "odd_even_pages: true\n"
             "cover_form_protection: true\n"
             "draft_version: 征求意见稿\n"
+            "consistency_degree: MOD\n"
+            "record_number: 1234-2026\n"
+            "important_notice: 涉及人身安全的整体提示。\n"
+            "symbols_lead: 下列符号适用于本文件。\n"
             "---\n\n"
             "# 范围\n\n正文。\n"
         )
@@ -259,6 +282,10 @@ class CrossReferenceParserTest(unittest.TestCase):
         self.assertTrue(enabled_doc.meta.odd_even_pages)
         self.assertTrue(enabled_doc.meta.cover_form_protection)
         self.assertEqual(enabled_doc.meta.draft_version, "征求意见稿")
+        self.assertEqual(enabled_doc.meta.consistency_degree, "MOD")
+        self.assertEqual(enabled_doc.meta.record_number, "1234-2026")
+        self.assertEqual(enabled_doc.meta.important_notice, "涉及人身安全的整体提示。")
+        self.assertEqual(enabled_doc.meta.symbols_lead, "下列符号适用于本文件。")
         self.assertEqual(chinese_key_doc.meta.draft_version, "报批稿")
 
     def test_page_break_markers_parse_as_body_blocks(self):
@@ -400,6 +427,39 @@ class CrossReferenceDocxTest(unittest.TestCase):
 
         self.assertIn("地热温泉", bold_texts)
         self.assertIn("geothermal hot spring", bold_texts)
+
+    def test_explicit_term_marker_emits_term_definition_note_and_source(self):
+        xml = _build_docx_xml(
+            "# 术语和定义\n\n"
+            "{术语：地热温泉 | geothermal hot spring}\n\n"
+            "出水温度不低于25 ℃的地下热水。\n\n"
+            "注：用于资源开发利用语境。\n\n"
+            "[来源：GB/T 11615—2010，3.1，有修改]\n"
+        )
+        root = ET.fromstring(xml)
+        texts = [self._et_text(p) for p in root.findall(".//w:p", self._W_NS)]
+
+        lead_index = texts.index("下列术语和定义适用于本文件。")
+        term_index = next(i for i, text in enumerate(texts) if "geothermal hot spring" in text)
+        definition_index = texts.index("出水温度不低于25 ℃的地下热水。")
+        note_index = texts.index("用于资源开发利用语境。")
+        source_index = texts.index("[来源：GB/T 11615—2010，3.1，有修改]")
+
+        self.assertLess(lead_index, term_index)
+        self.assertLess(term_index, definition_index)
+        self.assertLess(definition_index, note_index)
+        self.assertLess(note_index, source_index)
+
+        term_paragraph = self._et_paragraph_containing(root, "geothermal hot spring")
+        bold_texts = [
+            "".join(t.text or "" for t in run.findall(".//w:t", self._W_NS))
+            for run in term_paragraph.findall("w:r", self._W_NS)
+            if run.find("w:rPr/w:b", self._W_NS) is not None
+        ]
+        self.assertIn("地热温泉", bold_texts)
+        self.assertIn("geothermal hot spring", bold_texts)
+        source_paragraph = self._et_paragraph_containing(root, "GB/T 11615")
+        self.assertIsNotNone(source_paragraph.find(".//w:rStyle", self._W_NS))
 
     def test_declared_standard_styles_are_used_for_examples_sources_and_appendix_title(self):
         xml = _build_docx_xml(
@@ -622,6 +682,41 @@ class CrossReferenceDocxTest(unittest.TestCase):
                 self._W_NS,
             )
             self.assertIsNotNone(restart)
+
+    def test_body_basic_elements_emit_notice_and_default_leads(self):
+        xml = _build_cover_docx_xml(
+            "---\n"
+            "title: 基础要素测试标准\n"
+            "important_notice: 涉及人身安全的整体提示。\n"
+            "symbols_lead: 下列符号适用于本文件。\n"
+            "---\n\n"
+            "# 范围\n\n"
+            "正文。\n\n"
+            "# 规范性引用文件\n\n"
+            "GB/T 1.1  标准化工作导则\n\n"
+            "# 术语和定义\n\n"
+            "## 地热资源  geothermal resources\n\n"
+            "赋存于地球内部的热能资源。\n\n"
+            "# 符号和缩略语\n\n"
+            "A —— 面积。\n"
+        )
+        root = ET.fromstring(xml)
+        texts = [self._et_text(p) for p in root.findall(".//w:p", self._W_NS)]
+
+        title_index = texts.index("基础要素测试标准")
+        notice_index = texts.index("重要提示：涉及人身安全的整体提示。")
+        scope_index = texts.index("范围")
+
+        self.assertLess(title_index, notice_index)
+        self.assertLess(notice_index, scope_index)
+        self.assertIn(
+            "下列文件中的内容通过文中的规范性引用而构成本文件必不可少的条款。"
+            "其中，注日期的引用文件，仅该日期对应的版本适用于本文件；"
+            "不注日期的引用文件，其最新版本（包括所有的修改单）适用于本文件。",
+            texts,
+        )
+        self.assertIn("下列术语和定义适用于本文件。", texts)
+        self.assertIn("下列符号适用于本文件。", texts)
 
     def _paragraph_containing(self, xml: str, text: str) -> str:
         text_pos = xml.index(text)
@@ -1084,6 +1179,23 @@ class CoverBackendDocxTest(unittest.TestCase):
                 else:
                     self.assertIn(publisher, xml)
                 self.assertNotIn("点击此处添加标准名称", xml)
+
+    def test_cover_backend_replaces_consistency_degree_placeholder(self):
+        xml = _build_cover_docx_xml(
+            "---\n"
+            "standard_type: 国家标准\n"
+            "number: GB/T 99999-2026\n"
+            "title: 一致性标识测试标准\n"
+            "title_en: Consistency degree test standard\n"
+            "consistency_degree: MOD\n"
+            "---\n\n"
+            "# 范围\n\n"
+            "正文。\n",
+            kind="national",
+        )
+
+        self.assertIn("（MOD）", xml)
+        self.assertNotIn("点击此处添加与国际标准一致性程度的标识", xml)
 
     def test_cover_backend_keeps_seq_groups_and_appendix_scope(self):
         xml = _build_cover_docx_xml(

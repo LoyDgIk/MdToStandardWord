@@ -1104,6 +1104,35 @@ def _set_field_or_placeholder(doc, style_name: str, text: str, patterns: List[st
     return False
 
 
+def _format_parenthesized(text: str) -> str:
+    value = (text or "").strip()
+    if not value:
+        return ""
+    if value.startswith(("(", "（")) and value.endswith((")", "）")):
+        return value
+    return "（%s）" % value
+
+
+def _set_record_number(doc, text: str) -> bool:
+    value = (text or "").strip()
+    if not value:
+        return False
+    if not value.startswith("备案号"):
+        value = "备案号：%s" % value
+    for p in doc.paragraphs:
+        if "备案号" in (p.text or ""):
+            _replace_text_keep_format(p, value)
+            return True
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    if "备案号" in (p.text or ""):
+                        _replace_text_keep_format(p, value)
+                        return True
+    return False
+
+
 def _replace_text_keep_format(p: Paragraph, text: str):
     runs = p.runs
     if runs:
@@ -1364,8 +1393,21 @@ def _apply_cover_fields(doc, meta: model.Meta, kind: Optional[str] = None):
         _set_field_or_placeholder(doc, S.S_COVER_NAME_EN, meta.title_en, [
             r"^点击此处添加标准名称的英文译名$",
         ])
+    if meta.consistency_degree:
+        _set_field_or_placeholder(
+            doc,
+            S.S_COVER_CONSISTENCY,
+            _format_parenthesized(meta.consistency_degree),
+            [
+                r"一致性程度",
+                r"一致程度",
+                r"点击此处添加与国际标准一致性程度的标识",
+            ],
+        )
     if meta.draft_version:
         _set_legacy_dropdown_value(doc, "下拉1", meta.draft_version)
+    if meta.record_number:
+        _set_record_number(doc, meta.record_number)
     if meta.publish_date:
         _set_field_or_placeholder(doc, S.S_COVER_PUBLISH, "%s发布" % meta.publish_date, [
             r"^XXXX\s*-\s*XX\s*-\s*XX发布$",
@@ -1576,27 +1618,44 @@ def _emit_source(anchor: Paragraph, doc, source: model.Source):
         pass
 
 
+def _split_term_text(text: str):
+    m = _TERM_SPLIT_RE.match((text or "").strip())
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return (text or "").strip(), ""
+
+
+def _emit_term_title(anchor: Paragraph, doc, term: str, term_en: str = ""):
+    para = _new_paragraph_before(anchor, doc, S.S_TERM_1)
+    _set_numbering(para, S.NUM_BODY, 2)
+    para.add_run().add_break()          # 让自动编号 3.1 单独占一行
+    r = para.add_run(term)
+    r.bold = True
+    if term_en:
+        para.add_run("　")
+        er = para.add_run(term_en)
+        er.bold = True
+    return para
+
+
 def _emit_term(anchor: Paragraph, doc, spans):
     """术语条目：编号(3.1)单独成行，下一行加粗中文术语 + 英文对应词。
 
     自动编号接入 numId=2 ilvl=2（术语为章 3 下的一级条）。
     """
-    text = "".join(s.text for s in spans).strip()
-    m = _TERM_SPLIT_RE.match(text)
-    if m:
-        cn, en = m.group(1).strip(), m.group(2).strip()
-    else:
-        cn, en = text, ""
-    para = _new_paragraph_before(anchor, doc, S.S_TERM_1)
-    _set_numbering(para, S.NUM_BODY, 2)
-    para.add_run().add_break()          # 让自动编号 3.1 单独占一行
-    r = para.add_run(cn)
-    r.bold = True
-    if en:
-        para.add_run("　")
-        er = para.add_run(en)
-        er.bold = True
-    return para
+    cn, en = _split_term_text("".join(s.text for s in spans))
+    return _emit_term_title(anchor, doc, cn, en)
+
+
+def _emit_term_entry(anchor: Paragraph, doc, term: model.Term):
+    _emit_term_title(anchor, doc, term.term, term.term_en)
+    if term.definition:
+        _new_paragraph_before(anchor, doc, S.S_PARA, spans=term.definition)
+    for note in term.notes:
+        style = S.S_NOTE_X if note.index else S.S_NOTE
+        _new_paragraph_before(anchor, doc, style, spans=note.spans)
+    if term.source is not None:
+        _emit_source(anchor, doc, term.source)
 
 
 def _emit_body_block(anchor: Paragraph, doc, blk, in_terms=False, in_normrefs=False,
@@ -1608,6 +1667,8 @@ def _emit_body_block(anchor: Paragraph, doc, blk, in_terms=False, in_normrefs=Fa
             return
         style = S.HEADING_STYLE_BY_LEVEL.get(blk.level, S.S_PARA)
         _new_paragraph_before(anchor, doc, style, spans=blk.spans)
+    elif isinstance(blk, model.Term):
+        _emit_term_entry(anchor, doc, blk)
     elif isinstance(blk, model.Paragraph):
         if in_normrefs:
             _emit_normative_ref(anchor, doc, blk.spans)
@@ -1663,6 +1724,20 @@ def _emit_body_standard_title(anchor: Paragraph, doc, meta: model.Meta):
             para.add_run().add_break()
         run = para.add_run(line)
         run.bold = True
+
+
+_IMPORTANT_NOTICE_PREFIX_RE = re.compile(r"^(?:重要提示|危险|警告|注意)\s*[:：]")
+
+
+def _emit_important_notice(anchor: Paragraph, doc, meta: model.Meta):
+    lines = [x.strip() for x in (meta.important_notice or "").splitlines() if x.strip()]
+    if not lines:
+        return
+    for i, line in enumerate(lines):
+        text = line
+        if i == 0 and not _IMPORTANT_NOTICE_PREFIX_RE.match(text):
+            text = "重要提示：" + text
+        _new_paragraph_before(anchor, doc, S.S_IMPORTANT_NOTICE, text=text)
 
 
 def _emit_formula(anchor: Paragraph, doc, formula, style=None, appendix_letter=None):
@@ -2007,8 +2082,8 @@ def _emit_figure(anchor: Paragraph, doc, fig: model.Figure, appendix_letter=None
     )
 
 
-def _emit_body_blocks(anchor: Paragraph, doc, blocks: List[object]):
-    blocks = _inject_chapter_boilerplate(blocks)
+def _emit_body_blocks(anchor: Paragraph, doc, blocks: List[object], meta: Optional[model.Meta] = None):
+    blocks = _inject_chapter_boilerplate(blocks, meta=meta)
     in_terms = False
     in_normrefs = False
     ordered_list_num_id = None
@@ -2055,30 +2130,69 @@ def _build_body(doc, sdoc: model.StandardDoc):
         pass
 
     _emit_body_standard_title(term_p, doc, sdoc.meta)
-    _emit_body_blocks(term_p, doc, sdoc.body)
+    _emit_important_notice(term_p, doc, sdoc.meta)
+    _emit_body_blocks(term_p, doc, sdoc.body, meta=sdoc.meta)
 
 
-def _inject_chapter_boilerplate(body: List[object]) -> List[object]:
+def _chapter_blocks(body: List[object], start: int) -> List[object]:
+    out = []
+    for blk in body[start + 1:]:
+        if isinstance(blk, model.Heading) and blk.level == 1:
+            break
+        out.append(blk)
+    return out
+
+
+def _first_block_text(blocks: List[object]) -> str:
+    for blk in blocks:
+        text = getattr(blk, "text", "")
+        if text:
+            return text.strip()
+    return ""
+
+
+def _starts_with_any(text: str, prefixes: List[str]) -> bool:
+    return any((text or "").startswith(prefix) for prefix in prefixes)
+
+
+def _lead_paragraph(text: str) -> model.Paragraph:
+    return model.Paragraph(spans=[model.Span(text)])
+
+
+def _inject_chapter_boilerplate(body: List[object], meta: Optional[model.Meta] = None) -> List[object]:
     """为 规范性引用文件 / 术语和定义 / 符号和缩略语 空章补默认导语。"""
     out: List[object] = []
-    n = len(body)
     for i, blk in enumerate(body):
         out.append(blk)
         if isinstance(blk, model.Heading) and blk.level == 1:
             title = blk.text.strip()
-            # 判断该章后是否紧跟另一个一级章（即本章无正文内容）
-            has_content = False
-            for j in range(i + 1, n):
-                nb = body[j]
-                if isinstance(nb, model.Heading) and nb.level == 1:
-                    break
-                has_content = True
-                break
+            content = _chapter_blocks(body, i)
+            has_content = bool(content)
+            first_text = _first_block_text(content)
             if not has_content:
                 if title == S.CH_NORMATIVE_REF:
-                    out.append(model.Paragraph(spans=[model.Span(bp.NORMATIVE_REF_NONE)]))
+                    out.append(_lead_paragraph(bp.NORMATIVE_REF_NONE))
                 elif title == S.CH_TERMS:
-                    out.append(model.Paragraph(spans=[model.Span(bp.TERMS_NONE)]))
+                    out.append(_lead_paragraph(bp.TERMS_NONE))
+            elif title == S.CH_NORMATIVE_REF and not _starts_with_any(first_text, [
+                "下列文件中的内容通过文中的规范性引用",
+                bp.NORMATIVE_REF_NONE,
+            ]):
+                out.append(_lead_paragraph(bp.NORMATIVE_REF_LEAD))
+            elif title == S.CH_TERMS and not _starts_with_any(first_text, [
+                "下列术语和定义适用于本文件",
+                "界定的术语和定义适用于本文件",
+                "界定的以及下列术语和定义适用于本文件",
+                bp.TERMS_NONE,
+            ]):
+                out.append(_lead_paragraph(bp.TERMS_LEAD))
+            elif title == S.CH_SYMBOLS and not _starts_with_any(first_text, [
+                "下列符号适用于本文件",
+                "下列缩略语适用于本文件",
+                "下列符号和缩略语适用于本文件",
+            ]):
+                lead = (meta.symbols_lead if meta is not None else "") or bp.SYMBOLS_LEAD
+                out.append(_lead_paragraph(lead))
     return out
 
 
@@ -2351,7 +2465,8 @@ def _emit_cover_sections(doc, sdoc: model.StandardDoc, end_line_image: bytes, ki
         _emit_cover_introduction(anchor, doc, sdoc.meta, kind)
     front_break()
     _emit_body_standard_title(anchor, doc, sdoc.meta)
-    _emit_body_blocks(anchor, doc, sdoc.body)
+    _emit_important_notice(anchor, doc, sdoc.meta)
+    _emit_body_blocks(anchor, doc, sdoc.body, meta=sdoc.meta)
     for idx, appx in enumerate(sdoc.appendices):
         body_break(start=1 if not body_started else None)
         _emit_appendices(

@@ -165,6 +165,10 @@ class Term:
     notes: List[Note] = field(default_factory=list)
     source: Optional[Source] = None
 
+    @property
+    def text(self) -> str:
+        return self.term
+
 
 @dataclass
 class TableModel:
@@ -267,14 +271,18 @@ class Meta:
     replaces: str = ""
     title: str = ""
     title_en: str = ""
+    consistency_degree: str = ""
     draft_version: str = ""
     ics: str = ""
     ccs: str = ""
+    record_number: str = ""
     publish_date: str = ""
     implement_date: str = ""
     publisher: str = ""
     foreword: Foreword = field(default_factory=Foreword)
     introduction: str = ""
+    important_notice: str = ""
+    symbols_lead: str = ""
     odd_even_pages: bool = False
     cover_form_protection: bool = False
 
