@@ -761,6 +761,10 @@ def _parse_html_table_block(content: str):
 _NOTE_RE = re.compile(r"^\s*注\s*(\d+)?\s*[:：]")
 _EXAMPLE_RE = re.compile(r"^\s*示例\s*(\d+)?\s*[:：]")
 _SOURCE_RE = re.compile(r"^\s*\[?\s*来源\s*[:：]")
+_TABLE_NOTE_RE = re.compile(r"^\s*\{\s*表注\s*(?P<index>\d+)?\s*[:：]\s*(?P<content>.*?)\s*\}\s*$")
+_FIGURE_NOTE_RE = re.compile(r"^\s*\{\s*图注\s*(?P<index>\d+)?\s*[:：]\s*(?P<content>.*?)\s*\}\s*$")
+_TABLE_SOURCE_RE = re.compile(r"^\s*\{\s*表来源\s*[:：]\s*(?P<content>.*?)\s*\}\s*$")
+_FIGURE_SOURCE_RE = re.compile(r"^\s*\{\s*图来源\s*[:：]\s*(?P<content>.*?)\s*\}\s*$")
 _TERM_MARKER_RE = re.compile(r"^\s*\{\s*术语\s*[:：]\s*(.+?)\s*\}\s*$")
 _TERM_SPLIT_RE = re.compile(r"^(.*?)(?:\s*[|｜]\s*|[\s　]{2,})(.+)$")
 _TABLE_CAP_RE = re.compile(r"^\s*\{\s*表\s*[:：]\s*#([^}\s]+)\s*\}\s+(.+?)\s*$")
@@ -789,6 +793,91 @@ def _marker_content_start(text: str, marker_end: int) -> int:
     return pos
 
 
+def _clone_span_with_text(sp: model.Span, text: str) -> model.Span:
+    if isinstance(sp, model.RefSpan):
+        return model.RefSpan(
+            text=text,
+            bold=sp.bold,
+            italic=sp.italic,
+            subscript=sp.subscript,
+            superscript=sp.superscript,
+            ref_type=sp.ref_type,
+            target=sp.target,
+            mode=sp.mode,
+        )
+    if isinstance(sp, model.FormulaSpan):
+        return model.FormulaSpan(
+            text,
+            bold=sp.bold,
+            italic=sp.italic,
+            subscript=sp.subscript,
+            superscript=sp.superscript,
+        )
+    return model.Span(text, sp.bold, sp.italic, sp.subscript, sp.superscript)
+
+
+def _slice_spans(spans: List[model.Span], start: int, end: int) -> List[model.Span]:
+    """按 `_spans_text(spans)` 的字符位置截取，保留行内格式和引用片段。"""
+    out: List[model.Span] = []
+    pos = 0
+    for sp in spans:
+        sp_end = pos + len(sp.text)
+        if sp_end <= start:
+            pos = sp_end
+            continue
+        if pos >= end:
+            break
+        local_start = max(0, start - pos)
+        local_end = min(len(sp.text), end - pos)
+        piece = sp.text[local_start:local_end]
+        if piece:
+            if local_start == 0 and local_end == len(sp.text):
+                out.append(sp)
+            else:
+                out.append(_clone_span_with_text(sp, piece))
+        pos = sp_end
+    return out
+
+
+def _parse_figure_table_addon(spans: List[model.Span]):
+    text = _spans_text(spans)
+    for ref_type, regex in (("tbl", _TABLE_NOTE_RE), ("fig", _FIGURE_NOTE_RE)):
+        m = regex.match(text)
+        if not m:
+            continue
+        content_spans = _slice_spans(spans, m.start("content"), m.end("content"))
+        return (
+            ref_type,
+            "note",
+            model.Note(
+                spans=content_spans,
+                index=int(m.group("index")) if m.group("index") else None,
+            ),
+        )
+    for ref_type, regex in (("tbl", _TABLE_SOURCE_RE), ("fig", _FIGURE_SOURCE_RE)):
+        m = regex.match(text)
+        if not m:
+            continue
+        content_spans = _slice_spans(spans, m.start("content"), m.end("content"))
+        return ref_type, "source", model.FigureTableSource(spans=content_spans)
+    return None
+
+
+def _attach_figure_table_addon(target, addon):
+    ref_type, kind, value = addon
+    label = "表" if ref_type == "tbl" else "图"
+    suffix = "注" if kind == "note" else "来源"
+    expected_type = model.TableModel if ref_type == "tbl" else model.Figure
+    if not isinstance(target, expected_type):
+        raise ValueError("%s%s必须紧跟%s。" % (label, suffix, "表格" if ref_type == "tbl" else "图片"))
+    if kind == "note":
+        target.notes.append(value)
+        return
+    if target.source is not None:
+        raise ValueError("%s来源只能写一次。" % label)
+    target.source = value
+
+
 def parse(text: str) -> model.StandardDoc:
     data, body_md = split_front_matter(text)
     doc = model.StandardDoc(meta=build_meta(data))
@@ -803,6 +892,7 @@ def parse(text: str) -> model.StandardDoc:
     cur_index_group = None
     table_caption = None      # None 或 (caption_text, verbatim_bool)
     expect_example_content = False
+    last_addon_target = None
 
     idx = 0
     while idx < len(blocks):
@@ -811,6 +901,7 @@ def parse(text: str) -> model.StandardDoc:
 
         # --- 标题：可能切换 mode ---
         if kind == "heading":
+            last_addon_target = None
             lvl, spans = blk[1], blk[2]
             htext = _spans_text(spans).strip()
             if lvl == 1:
@@ -872,6 +963,16 @@ def parse(text: str) -> model.StandardDoc:
                         doc.body.append(target_block)
                     elif mode == "appendix" and cur_appendix is not None:
                         cur_appendix.blocks.append(target_block)
+                last_addon_target = None
+                idx += 1
+                continue
+
+        # --- 表/图附加项：只绑定紧邻的上一张表或图 ---
+        if kind == "para":
+            addon = _parse_figure_table_addon(blk[1])
+            if addon is not None:
+                _attach_figure_table_addon(last_addon_target, addon)
+                expect_example_content = False
                 idx += 1
                 continue
 
@@ -881,6 +982,7 @@ def parse(text: str) -> model.StandardDoc:
             if idx + 1 < len(blocks) and blocks[idx + 1][0] == "table":
                 m_cap = _TABLE_CAP_RE.match(ptext)
                 if m_cap:
+                    last_addon_target = None
                     anchor = _parse_typed_anchor(m_cap.group(1).strip(), "tbl", "表题")
                     title = m_cap.group(2).strip()
                     _assert_clean_caption("tbl", title, "表题")
@@ -895,6 +997,7 @@ def parse(text: str) -> model.StandardDoc:
         target_block = _make_block(kind, blk, table_caption)
         table_caption = None
         if target_block is None:
+            last_addon_target = None
             idx += 1
             continue
 
@@ -905,6 +1008,11 @@ def parse(text: str) -> model.StandardDoc:
             and not _example_has_inline_content(target_block)
         )
 
+        can_accept_addons = (
+            isinstance(target_block, (model.TableModel, model.Figure))
+            and mode in ("body", "appendix")
+        )
+
         if mode == "body":
             doc.body.append(target_block)
         elif mode == "appendix" and cur_appendix is not None:
@@ -913,6 +1021,7 @@ def parse(text: str) -> model.StandardDoc:
             _route_reference(doc, kind, blk)
         elif mode == "index":
             _route_index(doc, cur_index_group, kind, blk)
+        last_addon_target = target_block if can_accept_addons else None
         idx += 1
 
     _normalize_terms(doc)
@@ -1102,10 +1211,19 @@ def _iter_block_spans(blk):
         yield from blk.definition
         for note in blk.notes:
             yield from note.spans
+    elif isinstance(blk, model.Figure):
+        for note in blk.notes:
+            yield from note.spans
+        if blk.source is not None:
+            yield from blk.source.spans
     elif isinstance(blk, model.ListBlock):
         for item in blk.items:
             yield from item.spans
     elif isinstance(blk, model.TableModel):
+        for note in blk.notes:
+            yield from note.spans
+        if blk.source is not None:
+            yield from blk.source.spans
         part_rows = []
         if blk.header_parts:
             part_rows.append(blk.header_parts)

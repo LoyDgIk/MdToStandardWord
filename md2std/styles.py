@@ -125,6 +125,9 @@ S_FIGURE_CAPTION = "标准文件_正文图标题"     # 图N 标题
 S_APPENDIX_TABLE_CAPTION = "标准文件_附录表标题"   # 表A.N 标题
 S_APPENDIX_FIGURE_CAPTION = "标准文件_附录图标题"  # 图A.N 标题
 S_TABLE_CELL = "标准文件_表格"             # 表格单元格内文字
+S_FIG_TABLE_NOTE = "标准文件_图表脚注"      # 图/表注段落
+S_FIG_TABLE_NOTE_CONTENT = "标准文件_图表脚注内容"  # 图/表注内容字符样式
+S_FIG_TABLE_SOURCE = "标准文件_图表说明"    # 图/表来源段落
 S_REF_ITEM = "标准文件_参考文献条目"
 
 # --- 内置 ------------------------------------------------------------------

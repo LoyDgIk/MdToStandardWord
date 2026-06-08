@@ -297,6 +297,64 @@ def _emit_visible_caption(para: Paragraph, ref_type: str, seq_name: str,
             _add_bookmark_ends_after(seq_end_run, [bm_num_id, bm_label_id, bm_full_id])
 
 
+def _apply_character_style(doc, run, style_name: str):
+    try:
+        run.style = doc.styles[style_name]
+    except Exception:
+        _apply_style_run_properties(doc, run, style_name)
+
+
+def _add_character_styled_runs(paragraph: Paragraph, doc, style_name: str,
+                               spans: List[model.Span]):
+    from .. import mathconv
+    for sp in spans:
+        if isinstance(sp, model.RefSpan):
+            _add_typed_ref(paragraph, sp)
+            continue
+        if isinstance(sp, model.FormulaSpan):
+            omath = mathconv.latex_to_omml(sp.text)
+            if omath is not None:
+                paragraph._p.append(omath)
+            else:
+                run = paragraph.add_run(sp.text)
+                _apply_character_style(doc, run, style_name)
+            continue
+        for i, piece in enumerate(sp.text.split("\n")):
+            if i > 0:
+                paragraph.add_run().add_break()
+            if piece:
+                run = paragraph.add_run(piece)
+                _apply_character_style(doc, run, style_name)
+                if sp.bold:
+                    run.bold = True
+                if sp.italic:
+                    run.italic = True
+                if getattr(sp, "subscript", False):
+                    run.font.subscript = True
+                if getattr(sp, "superscript", False):
+                    run.font.superscript = True
+
+
+def _emit_figure_table_note(anchor: Paragraph, doc, note: model.Note):
+    para = _new_paragraph_before(anchor, doc, S.S_FIG_TABLE_NOTE)
+    para.add_run("注%d：" % note.index if note.index else "注：")
+    _add_character_styled_runs(para, doc, S.S_FIG_TABLE_NOTE_CONTENT, note.spans)
+
+
+def _emit_figure_table_source(anchor: Paragraph, doc, source: model.FigureTableSource):
+    para = _new_paragraph_before(anchor, doc, S.S_FIG_TABLE_SOURCE)
+    para.add_run("来源：")
+    _set_runs(para, source.spans)
+
+
+def _emit_figure_table_addons(anchor: Paragraph, doc, obj):
+    for note in getattr(obj, "notes", []) or []:
+        _emit_figure_table_note(anchor, doc, note)
+    source = getattr(obj, "source", None)
+    if source is not None:
+        _emit_figure_table_source(anchor, doc, source)
+
+
 def _emit_formula_number(para: Paragraph, formula: model.Formula, appendix_letter=None):
     """输出公式右侧编号 `（1）` / `（A.1）`，显示值引用隐藏公式题注。"""
     para.add_run("（")
@@ -528,9 +586,11 @@ def _emit_table(anchor: Paragraph, doc, tbl: model.TableModel, appendix_letter=N
             )
             first = False
             start = end
+        _emit_figure_table_addons(anchor, doc, tbl)
         return
 
     _emit_table_part(anchor, doc, tbl, tbl.rows, row_parts, row_colspans, appendix_letter=appendix_letter)
+    _emit_figure_table_addons(anchor, doc, tbl)
 
 
 def _emit_figure(anchor: Paragraph, doc, fig: model.Figure, appendix_letter=None):
@@ -550,6 +610,7 @@ def _emit_figure(anchor: Paragraph, doc, fig: model.Figure, appendix_letter=None
         cap, "fig", SEQ_FIGURE, "图", fig.anchor_id, fig.caption or "",
         appendix_letter=appendix_letter,
     )
+    _emit_figure_table_addons(anchor, doc, fig)
 
 
 def _emit_body_blocks(anchor: Paragraph, doc, blocks: List[object], meta: Optional[model.Meta] = None):

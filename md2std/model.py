@@ -150,6 +150,16 @@ class Source:
 
 
 @dataclass
+class FigureTableSource:
+    """表/图来源附加项，保留行内格式与交叉引用。"""
+    spans: List[Span] = field(default_factory=list)
+
+    @property
+    def text(self) -> str:
+        return "".join(s.text for s in self.spans)
+
+
+@dataclass
 class Term:
     """术语条目（术语和定义章内）。
 
@@ -178,6 +188,7 @@ class TableModel:
     anchor_id 为类型化交叉引用本地 id（来自 `{#tbl:id}`）。
     header_colspans/row_colspans 对应 HTML 表格的 colspan；GFM 表格默认为 1。
     header_parts/row_parts 保存单元格内文本/公式片段；header/rows 保留纯文本视图。
+    notes/source 为紧跟表格的显式表注、表来源附加项。
     """
     ref_type: str = "tbl"
     caption: str = ""
@@ -188,6 +199,8 @@ class TableModel:
     row_colspans: List[List[int]] = field(default_factory=list)
     header_parts: List[List[TableCellPart]] = field(default_factory=list)
     row_parts: List[List[List[TableCellPart]]] = field(default_factory=list)
+    notes: List[Note] = field(default_factory=list)
+    source: Optional[FigureTableSource] = None
 
 
 @dataclass
@@ -197,6 +210,8 @@ class Figure:
     caption: str = ""
     path: str = ""
     anchor_id: str = ""
+    notes: List[Note] = field(default_factory=list)
+    source: Optional[FigureTableSource] = None
 
 
 @dataclass

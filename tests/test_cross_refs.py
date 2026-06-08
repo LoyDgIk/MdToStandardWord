@@ -206,6 +206,80 @@ class CrossReferenceParserTest(unittest.TestCase):
         self.assertEqual(table.rows[-1], ["注：按临近分度线取值。"])
         self.assertEqual(table.row_colspans[-1], [2])
 
+    def test_table_addons_bind_to_previous_table_and_keep_spans(self):
+        doc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:classify} 温泉利用分类\n\n"
+            "| 项目 |\n"
+            "| --- |\n"
+            "| 医疗保健 |\n\n"
+            "{表注1：见{{fig:flow:label}}。}\n\n"
+            "{表注2：保留**强调**内容。}\n\n"
+            "{表来源：资料来自{{fig:flow:label}}。}\n\n"
+            "![流程图 {#fig:flow}](missing.png)\n"
+        )
+
+        table = next(b for b in doc.body if isinstance(b, model.TableModel))
+
+        self.assertEqual([note.index for note in table.notes], [1, 2])
+        self.assertEqual("".join(s.text for s in table.notes[0].spans), "见{{fig:flow:label}}。")
+        self.assertTrue(any(isinstance(s, model.RefSpan) for s in table.notes[0].spans))
+        self.assertEqual("".join(s.text for s in table.notes[1].spans), "保留强调内容。")
+        self.assertEqual("".join(s.text for s in table.notes[1].spans if s.bold), "强调")
+        self.assertIsNotNone(table.source)
+        self.assertTrue(any(isinstance(s, model.RefSpan) for s in table.source.spans))
+
+    def test_figure_addons_bind_to_previous_figure(self):
+        doc = md_parser.parse(
+            "# 范围\n\n"
+            "![流程图 {#fig:flow}](missing.png)\n\n"
+            "{图注：见{{tbl:classify:label}}。}\n\n"
+            "{图注1：编号图注。}\n\n"
+            "{图来源：资料来自项目组。}\n\n"
+            "{表：#tbl:classify} 温泉利用分类\n\n"
+            "| 项目 |\n"
+            "| --- |\n"
+            "| 医疗保健 |\n"
+        )
+
+        figure = next(b for b in doc.body if isinstance(b, model.Figure))
+
+        self.assertEqual([note.index for note in figure.notes], [None, 1])
+        self.assertEqual("".join(s.text for s in figure.notes[0].spans), "见{{tbl:classify:label}}。")
+        self.assertTrue(any(isinstance(s, model.RefSpan) for s in figure.notes[0].spans))
+        self.assertIsNotNone(figure.source)
+        self.assertEqual(figure.source.text, "资料来自项目组。")
+
+    def test_figure_table_addon_markers_require_matching_adjacent_target(self):
+        with self.assertRaisesRegex(ValueError, "表注必须紧跟表格"):
+            md_parser.parse("# 范围\n\n{表注：孤立表注。}\n")
+        with self.assertRaisesRegex(ValueError, "图注必须紧跟图片"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:classify} 温泉利用分类\n\n"
+                "| 项目 |\n"
+                "| --- |\n"
+                "| 医疗保健 |\n\n"
+                "{图注：类型不匹配。}\n"
+            )
+        with self.assertRaisesRegex(ValueError, "表注必须紧跟表格"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "![流程图 {#fig:flow}](missing.png)\n\n"
+                "{表注：类型不匹配。}\n"
+            )
+
+    def test_addon_cross_references_are_validated(self):
+        with self.assertRaisesRegex(ValueError, "未知交叉引用"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:classify} 温泉利用分类\n\n"
+                "| 项目 |\n"
+                "| --- |\n"
+                "| 医疗保健 |\n\n"
+                "{表注：见{{fig:missing:label}}。}\n"
+            )
+
     def test_nested_ordered_list_is_kept_as_second_level(self):
         doc = md_parser.parse(
             "# 范围\n\n"
@@ -469,6 +543,72 @@ class CrossReferenceDocxTest(unittest.TestCase):
         self.assertIn("（规范性）", appendix_head)
         self.assertIn("样式验证附录", appendix_head)
 
+    def test_table_addons_emit_after_table_with_declared_styles(self):
+        parts = _build_cover_docx_parts(
+            "# 范围\n\n"
+            "![说明图 {#fig:flow}](missing.png)\n\n"
+            "{表：#tbl:main} 测试表\n\n"
+            "| 项目 |\n"
+            "| --- |\n"
+            "| A |\n\n"
+            "{表注1：表注引用{{fig:flow:label}}。}\n\n"
+            "{表来源：表资料来源。}\n"
+        )
+        xml = parts["document"].decode("utf-8", errors="ignore")
+        root = ET.fromstring(parts["document"])
+
+        caption_pos = xml.index("测试表")
+        table_pos = xml.index("<w:tbl", caption_pos)
+        note_pos = xml.index("表注引用")
+        source_pos = xml.index("表资料来源")
+
+        self.assertLess(caption_pos, table_pos)
+        self.assertLess(table_pos, note_pos)
+        self.assertLess(note_pos, source_pos)
+        note_para = self._et_paragraph_containing(root, "表注引用")
+        source_para = self._et_paragraph_containing(root, "表资料来源")
+        note_style = self._style_id_by_name(parts["styles"], "标准文件_图表脚注")
+        note_content_style = self._style_id_by_name(parts["styles"], "标准文件_图表脚注内容")
+        source_style = self._style_id_by_name(parts["styles"], "标准文件_图表说明")
+
+        self.assertEqual(self._paragraph_style(note_para), note_style)
+        self.assertEqual(self._paragraph_style(source_para), source_style)
+        self.assertIsNotNone(note_para.find(f'.//w:rStyle[@w:val="{note_content_style}"]', self._W_NS))
+        self.assertIn(" REF _Ref", xml[xml.rfind("<w:p", 0, note_pos):xml.index("</w:p>", note_pos)])
+
+    def test_figure_addons_emit_after_caption_with_declared_styles(self):
+        parts = _build_cover_docx_parts(
+            "# 范围\n\n"
+            "{表：#tbl:main} 引用表\n\n"
+            "| 项目 |\n"
+            "| --- |\n"
+            "| A |\n\n"
+            "![测试图 {#fig:flow}](missing.png)\n\n"
+            "{图注：图注引用{{tbl:main:label}}。}\n\n"
+            "{图来源：图资料来源。}\n"
+        )
+        xml = parts["document"].decode("utf-8", errors="ignore")
+        root = ET.fromstring(parts["document"])
+
+        image_pos = xml.index("[缺少图片：missing.png]")
+        caption_pos = xml.index("测试图")
+        note_pos = xml.index("图注引用")
+        source_pos = xml.index("图资料来源")
+
+        self.assertLess(image_pos, caption_pos)
+        self.assertLess(caption_pos, note_pos)
+        self.assertLess(note_pos, source_pos)
+        note_para = self._et_paragraph_containing(root, "图注引用")
+        source_para = self._et_paragraph_containing(root, "图资料来源")
+        note_style = self._style_id_by_name(parts["styles"], "标准文件_图表脚注")
+        note_content_style = self._style_id_by_name(parts["styles"], "标准文件_图表脚注内容")
+        source_style = self._style_id_by_name(parts["styles"], "标准文件_图表说明")
+
+        self.assertEqual(self._paragraph_style(note_para), note_style)
+        self.assertEqual(self._paragraph_style(source_para), source_style)
+        self.assertIsNotNone(note_para.find(f'.//w:rStyle[@w:val="{note_content_style}"]', self._W_NS))
+        self.assertIn(" REF _Ref", xml[xml.rfind("<w:p", 0, note_pos):xml.index("</w:p>", note_pos)])
+
     def test_appendix_starts_on_new_page(self):
         xml = _build_docx_xml(
             "# 范围\n\n"
@@ -731,6 +871,19 @@ class CrossReferenceDocxTest(unittest.TestCase):
         num_id = paragraph.find("w:pPr/w:numPr/w:numId", self._W_NS)
         self.assertIsNotNone(num_id)
         return num_id.get(self._w_tag("val"))
+
+    def _paragraph_style(self, paragraph) -> str:
+        pstyle = paragraph.find("w:pPr/w:pStyle", self._W_NS)
+        self.assertIsNotNone(pstyle)
+        return pstyle.get(self._w_tag("val"))
+
+    def _style_id_by_name(self, styles_xml: bytes, name: str) -> str:
+        root = ET.fromstring(styles_xml)
+        for style in root.findall("w:style", self._W_NS):
+            name_el = style.find("w:name", self._W_NS)
+            if name_el is not None and name_el.get(self._w_tag("val")) == name:
+                return style.get(self._w_tag("styleId"))
+        self.fail("找不到样式：%s" % name)
 
     def _jc_value(self, paragraph) -> str:
         jc = paragraph.find("w:pPr/w:jc", self._W_NS)
