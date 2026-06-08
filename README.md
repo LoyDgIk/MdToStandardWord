@@ -13,7 +13,7 @@
 - 支持显式术语块，并兼容旧式二级标题术语写法。
 - 支持标准章节结构、条款层级、无标题条、列项、注、示例。
 - 支持 GFM 表格和简单 HTML 表格，HTML 表格可保留横向合并单元格。
-- 支持表注、表来源、图注、图来源等紧邻式图表附加项。
+- 支持表/图单位、来源、脚注等紧邻式图表附加项，并支持表格单元格内普通注。
 - 支持正文公式和表格单元格内公式片段。
 - 支持行内上标、下标，兼容 Typora/Obsidian 风格 `^...^`、`~...~` 扩展 Markdown。
 - 支持行内公式片段 `$$...$$`，用于让正文中的数学变量保持与公式一致的 Word 原生公式字体。
@@ -88,6 +88,28 @@ md2std input.md -o output.docx --word-com-postprocess
 | `--no-cover-form-protection` | 关闭封面表单域保护；用于覆盖 YAML 中的 `cover_form_protection: true`。 |
 
 生成后的文档首次在 Word 中打开时，如提示是否更新域，应选择更新。未启用 Word COM 后处理时，也可在 Word 中全选正文后按 `F9` 更新域。
+
+### PDF 导出与页面渲染
+
+项目提供 Windows 专用脚本 `scripts/render_docx_pdf.py`，使用 Microsoft Word COM 导出 PDF，不依赖 LibreOffice；如安装 `pypdfium2`，还会把 PDF 渲染为逐页 PNG 便于视觉检查。
+
+安装可选依赖：
+
+```powershell
+python -m pip install -e ".[render]"
+```
+
+导出 PDF 并渲染 PNG：
+
+```powershell
+python scripts/render_docx_pdf.py examples/图表附加项颗粒度示例.docx -o temp/图表示例.pdf
+```
+
+只导出 PDF：
+
+```powershell
+python scripts/render_docx_pdf.py examples/图表附加项颗粒度示例.docx -o temp/图表示例.pdf --no-png
+```
 
 ## Markdown 契约
 
@@ -186,18 +208,44 @@ introduction: |
 
 | 利用类别 | 适宜水温 |
 | --- | --- |
-| 医疗保健洗浴 | 36-45 |
+| 医疗保健洗浴〔注：适宜水温为常用建议范围。〕〔注：具体水温应结合安全要求调节。〕 | 36-45 |
 ```
 
-表格附加项应紧跟在目标表格之后：
+复杂 HTML 表格可使用 `rowspan`、`colspan`，也可用 HTML 属性控制边框：
 
 ```md
-{表注：单条表注内容。}
+{表：#tbl:merge} 合并和边框示例
 
-{表注1：多条表注中的第一条。}
-
-{表来源：资料来自试验记录。}
+<table data-border-outer="thick" data-border-inner="thin">
+  <tr>
+    <th rowspan="2" data-border-right="thick">类别</th>
+    <th colspan="2">指标</th>
+  </tr>
+  <tr>
+    <th>值</th>
+    <th data-border-bottom="none">备注</th>
+  </tr>
+  <tr>
+    <td>一类</td>
+    <td></td>
+    <td>同上</td>
+  </tr>
+</table>
 ```
+
+`data-border-outer`、`data-border-inner` 和单元格上的 `data-border-top/right/bottom/left` 支持 `none`、`thin`、`thick`。空单元格保持为空白；“同上”不做自动推断，按普通文本输出。
+
+图表通用附加项应紧跟在目标表格或图片之后，目标由上一张表或图自动确定：
+
+```md
+{单位} 单位为毫米
+
+{脚注} 脚注的内容。
+
+{来源} 资料来自试验记录。
+```
+
+表格中的普通注写在相关单元格内，使用 `〔注：...〕`；单元格可以只有注，例如 `<td colspan="3">〔注：...〕</td>`。同一单元格连续多个 `〔注：...〕` 会自动生成多条编号注，单条注使用不编号的注样式。需要在表格单元格中标出脚注引用点时，使用 `〔脚注〕`；脚注说明使用块级 `{脚注} ...`，编号由 `标准文件_图表脚注` 样式自动生成，不在 Markdown 中手写 a、b、c。
 
 图片示例：
 
@@ -205,17 +253,41 @@ introduction: |
 ![分级流程图 {#fig:flow}](images/flow.png)
 ```
 
-图片附加项应紧跟在目标图片之后：
+图片附加项也使用同一套通用标记：
 
 ```md
-{图注：单条图注内容。}
+{单位} 单位为毫米
 
-{图注1：多条图注中的第一条。}
+{脚注} 图脚注的内容。
 
-{图来源：资料来自流程设计文件。}
+{来源} 资料来自流程设计文件。
 ```
 
-表注、表来源只能绑定到紧邻的上一张表；图注、图来源只能绑定到紧邻的上一张图。附加项内容支持加粗、斜体、上下标、行内公式和类型化交叉引用。
+带分图、标引序号说明、图内段和图脚注的图片示例：
+
+```md
+{图：#fig:subparts} 分图示例
+
+{单位} 关于单位的陈述
+
+{分图组:2}
+
+![第一张分图题](images/subfigure-a.png)
+
+![第二张分图题](images/subfigure-b.png)
+
+{图标引} 说明的内容
+
+{图标引} 说明的内容
+
+{图段} 段（可包含要求型条款）〔注：图中的注的内容〕
+
+{脚注} 图脚注的内容
+```
+
+普通单图继续使用 `![图题 {#fig:id}](path)`；组合分图使用 `{图：#fig:id} 图题` 创建图题和锚点，再用 `{分图组:2}` 声明每行并排显示 2 张分图，后续连续 Markdown 图片块会归入该父图。分图编号 `a)`、`b)` 由生成器输出，不应预先画进图片。CLI 转换时，图片相对路径以输入 Markdown 文件所在目录为基准。
+
+`{单位}`、`{脚注}`、`{来源}` 只能绑定到紧邻的上一张表或图；`{分图组:2}`、`{图标引}`、`{图段}` 只能绑定到紧邻的上一张图。生成 DOCX 时，表的单位位于表题与表格之间并右对齐，表脚注另起跨列行，表来源位于表脚注之后另起跨列行；图的单位位于图片之前并右对齐，分图组、图标引、图段、图内段注、图脚注和图来源位于图片与图题之间。附加项和注内容支持加粗、斜体、上下标、行内公式和类型化交叉引用。
 
 公式示例：
 
@@ -231,12 +303,34 @@ $$T_r$$ ——热储温度，单位为摄氏度（℃）；
 m^3^/d ——立方米每天。
 ```
 
+多块示例使用 `{示例结束}` 显式结束：
+
+```md
+示例：
+
+第一段示例内容。
+
+{表：#tbl:example} 示例表
+
+| 项目 | 值 |
+| --- | --- |
+| A | 1 |
+
+第二段示例内容。
+
+{示例结束}
+```
+
+没有 `{示例结束}` 时，旧式单段示例写法继续可用。
+
 ## 示例
 
 | 文件 | 说明 |
 | --- | --- |
 | `examples/基础要素与术语块改进示例.md` | 国家标准示例，集中展示封面一致性程度标识、正文首页重要提示、标准章导语自动补齐、`symbols_lead` 和显式术语块。 |
-| `examples/图表附加项颗粒度示例.md` | 团体标准示例，集中展示表注、表来源、图注和图来源的紧邻绑定与生成效果。 |
+| `examples/图表附加项颗粒度示例.md` | 团体标准示例，按 GB/T 1.1 示例展示表单位、表内普通注、自动编号脚注和分图编排效果。 |
+| `examples/表格合并与边框颗粒度示例.md` | 团体标准示例，展示 `rowspan`、`colspan`、空单元格、“同上”、单元格边框和多块示例。 |
+| `examples/图表引用样式编号示例.md` | 团体标准示例，展示正文和附录图表题使用样式自动编号后的交叉引用效果。 |
 | `examples/地热温泉资源开发利用规范.md` | 团体标准示例，覆盖术语、无标题条、表格、附录、参考文献和索引。 |
 | `examples/汽车、摩托车用车速表.md` | 国家标准示例，覆盖国家标准封面、公式、HTML 表格和交叉引用。 |
 
@@ -259,6 +353,8 @@ python -m pip wheel . -w dist --no-deps
 ```powershell
 python -X utf8 -m md2std examples/基础要素与术语块改进示例.md -o examples/基础要素与术语块改进示例.docx --kind national
 python -X utf8 -m md2std examples/图表附加项颗粒度示例.md -o examples/图表附加项颗粒度示例.docx
+python -X utf8 -m md2std examples/表格合并与边框颗粒度示例.md -o examples/表格合并与边框颗粒度示例.docx
+python -X utf8 -m md2std examples/图表引用样式编号示例.md -o examples/图表引用样式编号示例.docx --word-com-postprocess
 python -X utf8 -m md2std examples/地热温泉资源开发利用规范.md -o examples/地热温泉资源开发利用规范.docx
 md2std examples/汽车、摩托车用车速表.md -o examples/汽车、摩托车用车速表.docx --kind national
 ```

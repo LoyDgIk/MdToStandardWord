@@ -21,6 +21,12 @@ dependencies = [
   "lxml>=4.9.0",
 ]
 
+[project.optional-dependencies]
+render = [
+  "pywin32>=306; platform_system == 'Windows'",
+  "pypdfium2>=4.30.0",
+]
+
 [project.scripts]
 md2std = "md2std.cli:main"
 

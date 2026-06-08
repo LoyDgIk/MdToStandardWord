@@ -40,12 +40,30 @@ class RefSpan(Span):
 
 @dataclass
 class TableCellPart:
-    """表格单元格内片段。kind=text/formula/ref，formula 使用 LaTeX 源码。"""
+    """表格单元格内片段。
+
+    kind=text/formula/ref/footnote_ref/note，formula 使用 LaTeX 源码；
+    note 的 spans 保存 `〔注：...〕` 内容。
+    """
     kind: str
     text: str = ""
     ref_type: str = ""
     target: str = ""
     mode: str = "num"
+    subscript: bool = False
+    superscript: bool = False
+    spans: List[Span] = field(default_factory=list)
+
+
+@dataclass
+class TableCell:
+    """表格单元格结构，保留合并和单元格级边框信息。"""
+    text: str = ""
+    parts: List[TableCellPart] = field(default_factory=list)
+    colspan: int = 1
+    rowspan: int = 1
+    borders: dict = field(default_factory=dict)
+    header: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -142,6 +160,10 @@ class ExampleContent:
     """示例后续内容 -> 标准文件_示例内容。"""
     spans: List[Span] = field(default_factory=list)
 
+    @property
+    def text(self) -> str:
+        return "".join(s.text for s in self.spans)
+
 
 @dataclass
 class Source:
@@ -153,6 +175,45 @@ class Source:
 class FigureTableSource:
     """表/图来源附加项，保留行内格式与交叉引用。"""
     spans: List[Span] = field(default_factory=list)
+
+    @property
+    def text(self) -> str:
+        return "".join(s.text for s in self.spans)
+
+
+@dataclass
+class FigureTableFootnote:
+    """表/图脚注；编号由 `标准文件_图表脚注` 自动生成。"""
+    spans: List[Span] = field(default_factory=list)
+
+    @property
+    def text(self) -> str:
+        return "".join(s.text for s in self.spans)
+
+
+@dataclass
+class FigureSubfigure:
+    """分图：由独立图片和分图题组成，a)/b) 编号由生成器自动生成。"""
+    path: str = ""
+    caption: str = ""
+
+
+@dataclass
+class FigureKeyItem:
+    """图中标引序号说明项，如 `1——说明的内容`。"""
+    index: str
+    spans: List[Span] = field(default_factory=list)
+
+    @property
+    def text(self) -> str:
+        return "".join(s.text for s in self.spans)
+
+
+@dataclass
+class FigureBodyParagraph:
+    """图题前的图内段落，可带普通注。"""
+    spans: List[Span] = field(default_factory=list)
+    notes: List[Note] = field(default_factory=list)
 
     @property
     def text(self) -> str:
@@ -188,7 +249,9 @@ class TableModel:
     anchor_id 为类型化交叉引用本地 id（来自 `{#tbl:id}`）。
     header_colspans/row_colspans 对应 HTML 表格的 colspan；GFM 表格默认为 1。
     header_parts/row_parts 保存单元格内文本/公式片段；header/rows 保留纯文本视图。
-    notes/source 为紧跟表格的显式表注、表来源附加项。
+    cell_rows 保存单元格级结构，用于 rowspan 和单元格边框输出。
+    footnotes/source/unit 为紧跟表格的显式脚注、来源和单位附加项；
+    普通注写在被注释内容所在单元格内。
     """
     ref_type: str = "tbl"
     caption: str = ""
@@ -199,8 +262,13 @@ class TableModel:
     row_colspans: List[List[int]] = field(default_factory=list)
     header_parts: List[List[TableCellPart]] = field(default_factory=list)
     row_parts: List[List[List[TableCellPart]]] = field(default_factory=list)
-    notes: List[Note] = field(default_factory=list)
+    cell_rows: List[List[TableCell]] = field(default_factory=list)
+    header_row_count: int = 0
+    border_outer: str = ""
+    border_inner: str = ""
+    footnotes: List[FigureTableFootnote] = field(default_factory=list)
     source: Optional[FigureTableSource] = None
+    unit: Optional[FigureTableSource] = None
 
 
 @dataclass
@@ -210,8 +278,13 @@ class Figure:
     caption: str = ""
     path: str = ""
     anchor_id: str = ""
-    notes: List[Note] = field(default_factory=list)
+    subfigures: List[FigureSubfigure] = field(default_factory=list)
+    subfigure_columns: int = 0
+    key_items: List[FigureKeyItem] = field(default_factory=list)
+    body_paragraphs: List[FigureBodyParagraph] = field(default_factory=list)
+    footnotes: List[FigureTableFootnote] = field(default_factory=list)
     source: Optional[FigureTableSource] = None
+    unit: Optional[FigureTableSource] = None
 
 
 @dataclass

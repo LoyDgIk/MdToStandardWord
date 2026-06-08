@@ -35,6 +35,7 @@ def _build_docx_parts(markdown: str) -> dict:
         with zipfile.ZipFile(path) as zf:
             return {
                 "document": zf.read("word/document.xml"),
+                "styles": zf.read("word/styles.xml"),
                 "numbering": zf.read("word/numbering.xml"),
             }
     finally:
@@ -206,26 +207,210 @@ class CrossReferenceParserTest(unittest.TestCase):
         self.assertEqual(table.rows[-1], ["注：按临近分度线取值。"])
         self.assertEqual(table.row_colspans[-1], [2])
 
-    def test_table_addons_bind_to_previous_table_and_keep_spans(self):
+    def test_html_table_rowspan_borders_empty_and_same_are_structured(self):
+        doc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:merge} 合并边框表\n\n"
+            "<table data-border-outer=\"thick\" data-border-inner=\"thin\">"
+            "<tr><th rowspan=\"2\" data-border-right=\"thick\">类别</th><th colspan=\"2\">指标</th></tr>"
+            "<tr><th>值</th><th data-border-bottom=\"none\">备注</th></tr>"
+            "<tr><td>一类</td><td></td><td>同上</td></tr>"
+            "</table>"
+        )
+
+        table = next(b for b in doc.body if isinstance(b, model.TableModel))
+
+        self.assertEqual(table.border_outer, "thick")
+        self.assertEqual(table.border_inner, "thin")
+        self.assertEqual(table.cell_rows[0][0].text, "类别")
+        self.assertEqual(table.cell_rows[0][0].rowspan, 2)
+        self.assertEqual(table.cell_rows[0][0].borders["right"], "thick")
+        self.assertEqual(table.cell_rows[0][1].colspan, 2)
+        self.assertEqual(table.cell_rows[1][1].borders["bottom"], "none")
+        self.assertEqual(table.rows[-1], ["一类", "", "同上"])
+        self.assertEqual(table.cell_rows[-1][1].text, "")
+        self.assertEqual(table.cell_rows[-1][2].text, "同上")
+
+    def test_html_table_rejects_invalid_spans_and_borders(self):
+        with self.assertRaisesRegex(ValueError, "rowspan 必须为正整数"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:bad} 坏表\n\n"
+                "<table><tr><td rowspan=\"0\">A</td></tr></table>"
+            )
+        with self.assertRaisesRegex(ValueError, "rowspan 超出表格行数"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:bad} 坏表\n\n"
+                "<table><tr><td rowspan=\"2\">A</td></tr></table>"
+            )
+        with self.assertRaisesRegex(ValueError, "data-border-left 只支持"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:bad} 坏表\n\n"
+                "<table><tr><td data-border-left=\"wide\">A</td></tr></table>"
+            )
+
+    def test_explicit_example_end_keeps_multi_block_example_content(self):
+        doc = md_parser.parse(
+            "# 范围\n\n"
+            "示例：\n\n"
+            "第一段示例内容。\n\n"
+            "{表：#tbl:example} 示例表\n\n"
+            "<table><tr><td rowspan=\"2\">A</td><td>1</td></tr><tr><td>同上</td></tr></table>\n\n"
+            "第二段示例内容。\n\n"
+            "{示例结束}\n"
+        )
+
+        body_types = [type(block).__name__ for block in doc.body]
+
+        self.assertEqual(body_types, [
+            "Heading", "Example", "ExampleContent", "TableModel", "ExampleContent",
+        ])
+        self.assertEqual(doc.body[2].text, "第一段示例内容。")
+        self.assertEqual(doc.body[3].cell_rows[0][0].rowspan, 2)
+        self.assertEqual(doc.body[4].text, "第二段示例内容。")
+
+    def test_isolated_example_end_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "没有对应"):
+            md_parser.parse("# 范围\n\n{示例结束}\n")
+
+    def test_table_cell_footnote_ref_marker_is_structured(self):
+        doc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:sample} 表题\n\n"
+            "| 类型 | 内圆直径〔脚注〕 |\n"
+            "| --- | --- |\n"
+            "| A | 100 |\n\n"
+            "{脚注} 表脚注的内容\n"
+        )
+
+        table = next(b for b in doc.body if isinstance(b, model.TableModel))
+        self.assertEqual(table.header, ["类型", "内圆直径"])
+        self.assertEqual(table.header_parts[1][-1].kind, "footnote_ref")
+        self.assertEqual(table.header_parts[1][-1].text, "")
+        self.assertEqual(table.footnotes[0].text, "表脚注的内容")
+
+    def test_legacy_manual_footnote_labels_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "表格内脚注引用请写成"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:sample} 表题\n\n"
+                "| 类型 | 内圆直径{脚注a} |\n"
+                "| --- | --- |\n"
+                "| A | 100 |\n"
+            )
+        with self.assertRaisesRegex(ValueError, "表格内脚注引用请写成"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:sample} 表题\n\n"
+                "| 类型 | 内圆直径{脚注} |\n"
+                "| --- | --- |\n"
+                "| A | 100 |\n"
+            )
+        with self.assertRaisesRegex(ValueError, "图表附加项内容不要写进"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:sample} 表题\n\n"
+                "| 类型 | 内圆直径 |\n"
+                "| --- | --- |\n"
+                "| A | 100 |\n\n"
+                "{表脚注a：表脚注的内容}\n"
+            )
+        with self.assertRaisesRegex(ValueError, "图表附加项内容不要写进"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "![流程图 {#fig:flow}](missing.png)\n\n"
+                "{图脚注a：图脚注的内容}\n"
+            )
+
+    def test_table_cell_note_markers_are_structured(self):
+        doc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:sample} 表题\n\n"
+            "| 项目 |\n"
+            "| --- |\n"
+            "| 段内容〔注：见{{tbl:sample:label}}。〕〔注：保留**强调**内容。〕 |\n"
+        )
+
+        table = next(b for b in doc.body if isinstance(b, model.TableModel))
+        parts = table.row_parts[0][0]
+        note_parts = [part for part in parts if part.kind == "note"]
+
+        self.assertEqual(table.rows[0][0], "段内容")
+        self.assertEqual(len(note_parts), 2)
+        self.assertEqual("".join(s.text for s in note_parts[0].spans), "见{{tbl:sample:label}}。")
+        self.assertTrue(any(isinstance(s, model.RefSpan) for s in note_parts[0].spans))
+        self.assertEqual("".join(s.text for s in note_parts[1].spans), "保留强调内容。")
+        self.assertEqual("".join(s.text for s in note_parts[1].spans if s.bold), "强调")
+
+    def test_table_cell_note_marker_allows_standalone_notes_and_requires_continuity(self):
+        doc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:sample} 表题\n\n"
+            "| 项目 |\n"
+            "| --- |\n"
+            "| 〔注：单独注。〕 |\n"
+        )
+
+        table = next(b for b in doc.body if isinstance(b, model.TableModel))
+        self.assertEqual(table.rows[0][0], "")
+        self.assertEqual(len(table.row_parts[0][0]), 1)
+        self.assertEqual(table.row_parts[0][0][0].kind, "note")
+        self.assertEqual("".join(s.text for s in table.row_parts[0][0][0].spans), "单独注。")
+
+        with self.assertRaisesRegex(ValueError, "内联普通注请写成"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:sample} 表题\n\n"
+                "| 项目 |\n"
+                "| --- |\n"
+                "| {注：孤立注} |\n"
+            )
+        with self.assertRaisesRegex(ValueError, "表格单元格注必须连续写在被注释内容之后"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:sample} 表题\n\n"
+                "| 项目 |\n"
+                "| --- |\n"
+                "| 段内容〔注：注内容〕后续文本 |\n"
+            )
+
+    def test_body_note_marker_is_regular_note_and_braced_note_is_rejected(self):
+        doc = md_parser.parse("# 范围\n\n注：单条注。\n\n注：第二条注。\n")
+        notes = [b for b in doc.body if isinstance(b, model.Note)]
+
+        self.assertEqual(["".join(s.text for s in note.spans) for note in notes], ["单条注。", "第二条注。"])
+        with self.assertRaisesRegex(ValueError, "正文注不要写进"):
+            md_parser.parse("# 范围\n\n{注：旧写法。}\n")
+
+    def test_table_addons_bind_to_previous_table_and_keep_cell_note_spans(self):
         doc = md_parser.parse(
             "# 范围\n\n"
             "{表：#tbl:classify} 温泉利用分类\n\n"
             "| 项目 |\n"
             "| --- |\n"
-            "| 医疗保健 |\n\n"
-            "{表注1：见{{fig:flow:label}}。}\n\n"
-            "{表注2：保留**强调**内容。}\n\n"
-            "{表来源：资料来自{{fig:flow:label}}。}\n\n"
+            "| 医疗保健〔注：见{{fig:flow:label}}。〕〔注：保留**强调**内容。〕 |\n\n"
+            "{单位} 单位为{{fig:flow:label}}。\n\n"
+            "{脚注} 表脚注见{{fig:flow:label}}。\n\n"
+            "{来源} 资料来自{{fig:flow:label}}。\n\n"
             "![流程图 {#fig:flow}](missing.png)\n"
         )
 
         table = next(b for b in doc.body if isinstance(b, model.TableModel))
+        note_parts = [part for part in table.row_parts[0][0] if part.kind == "note"]
 
-        self.assertEqual([note.index for note in table.notes], [1, 2])
-        self.assertEqual("".join(s.text for s in table.notes[0].spans), "见{{fig:flow:label}}。")
-        self.assertTrue(any(isinstance(s, model.RefSpan) for s in table.notes[0].spans))
-        self.assertEqual("".join(s.text for s in table.notes[1].spans), "保留强调内容。")
-        self.assertEqual("".join(s.text for s in table.notes[1].spans if s.bold), "强调")
+        self.assertEqual(len(note_parts), 2)
+        self.assertIsNotNone(table.unit)
+        self.assertEqual("".join(s.text for s in table.unit.spans), "单位为{{fig:flow:label}}。")
+        self.assertTrue(any(isinstance(s, model.RefSpan) for s in table.unit.spans))
+        self.assertEqual("".join(s.text for s in note_parts[0].spans), "见{{fig:flow:label}}。")
+        self.assertTrue(any(isinstance(s, model.RefSpan) for s in note_parts[0].spans))
+        self.assertEqual("".join(s.text for s in note_parts[1].spans), "保留强调内容。")
+        self.assertEqual("".join(s.text for s in note_parts[1].spans if s.bold), "强调")
+        self.assertEqual(len(table.footnotes), 1)
+        self.assertEqual("".join(s.text for s in table.footnotes[0].spans), "表脚注见{{fig:flow:label}}。")
+        self.assertTrue(any(isinstance(s, model.RefSpan) for s in table.footnotes[0].spans))
         self.assertIsNotNone(table.source)
         self.assertTrue(any(isinstance(s, model.RefSpan) for s in table.source.spans))
 
@@ -233,9 +418,15 @@ class CrossReferenceParserTest(unittest.TestCase):
         doc = md_parser.parse(
             "# 范围\n\n"
             "![流程图 {#fig:flow}](missing.png)\n\n"
-            "{图注：见{{tbl:classify:label}}。}\n\n"
-            "{图注1：编号图注。}\n\n"
-            "{图来源：资料来自项目组。}\n\n"
+            "{单位} 单位为{{tbl:classify:label}}。\n\n"
+            "{图标引} 见{{tbl:classify:label}}。\n\n"
+            "{图标引} 保留**强调**内容。\n\n"
+            "{分图组:2}\n\n"
+            "![分图a](missing-a.png)\n\n"
+            "![分图b](missing-b.png)\n\n"
+            "{图段} 段（可包含要求型条款）〔注：图中的注引用{{tbl:classify:label}}。〕\n\n"
+            "{脚注} 图脚注。\n\n"
+            "{来源} 资料来自项目组。\n\n"
             "{表：#tbl:classify} 温泉利用分类\n\n"
             "| 项目 |\n"
             "| --- |\n"
@@ -244,16 +435,63 @@ class CrossReferenceParserTest(unittest.TestCase):
 
         figure = next(b for b in doc.body if isinstance(b, model.Figure))
 
-        self.assertEqual([note.index for note in figure.notes], [None, 1])
-        self.assertEqual("".join(s.text for s in figure.notes[0].spans), "见{{tbl:classify:label}}。")
-        self.assertTrue(any(isinstance(s, model.RefSpan) for s in figure.notes[0].spans))
+        self.assertIsNotNone(figure.unit)
+        self.assertEqual("".join(s.text for s in figure.unit.spans), "单位为{{tbl:classify:label}}。")
+        self.assertTrue(any(isinstance(s, model.RefSpan) for s in figure.unit.spans))
+        self.assertEqual([item.index for item in figure.key_items], ["1", "2"])
+        self.assertEqual("".join(s.text for s in figure.key_items[0].spans), "见{{tbl:classify:label}}。")
+        self.assertTrue(any(isinstance(s, model.RefSpan) for s in figure.key_items[0].spans))
+        self.assertEqual("".join(s.text for s in figure.key_items[1].spans if s.bold), "强调")
+        self.assertEqual(figure.subfigure_columns, 2)
+        self.assertEqual([(item.path, item.caption) for item in figure.subfigures], [
+            ("missing-a.png", "分图a"),
+            ("missing-b.png", "分图b"),
+        ])
+        self.assertEqual(figure.body_paragraphs[0].text, "段（可包含要求型条款）")
+        self.assertEqual("".join(s.text for s in figure.body_paragraphs[0].notes[0].spans), "图中的注引用{{tbl:classify:label}}。")
+        self.assertTrue(any(isinstance(s, model.RefSpan) for s in figure.body_paragraphs[0].notes[0].spans))
+        self.assertEqual(len(figure.footnotes), 1)
+        self.assertEqual(figure.footnotes[0].text, "图脚注。")
         self.assertIsNotNone(figure.source)
         self.assertEqual(figure.source.text, "资料来自项目组。")
 
+    def test_image_paths_resolve_from_markdown_file_location(self):
+        source_path = os.path.abspath(os.path.join("examples", "relative-input.md"))
+        doc = md_parser.parse(
+            "# 范围\n\n"
+            "![普通图 {#fig:single}](images/subfigure-a.png)\n\n"
+            "{图：#fig:subparts} 组合图\n\n"
+            "{分图组:2}\n\n"
+            "![第一张分图题 ](images/subfigure-a.png)\n\n"
+            "![第二张分图题](images/subfigure-b.png)\n",
+            source_path=source_path,
+        )
+        figures = [b for b in doc.body if isinstance(b, model.Figure)]
+
+        self.assertEqual(
+            figures[0].path,
+            os.path.abspath(os.path.join("examples", "images", "subfigure-a.png")),
+        )
+        self.assertEqual(figures[1].subfigure_columns, 2)
+        self.assertEqual(
+            [(os.path.basename(item.path), item.caption) for item in figures[1].subfigures],
+            [("subfigure-a.png", "第一张分图题"), ("subfigure-b.png", "第二张分图题")],
+        )
+        self.assertEqual(
+            figures[1].subfigures[0].path,
+            os.path.abspath(os.path.join("examples", "images", "subfigure-a.png")),
+        )
+
     def test_figure_table_addon_markers_require_matching_adjacent_target(self):
-        with self.assertRaisesRegex(ValueError, "表注必须紧跟表格"):
+        with self.assertRaisesRegex(ValueError, "表注语法已移除"):
             md_parser.parse("# 范围\n\n{表注：孤立表注。}\n")
-        with self.assertRaisesRegex(ValueError, "图注必须紧跟图片"):
+        with self.assertRaisesRegex(ValueError, "单位必须紧跟表格或图片"):
+            md_parser.parse("# 范围\n\n{单位} 单位为毫米。\n")
+        with self.assertRaisesRegex(ValueError, "脚注必须紧跟表格或图片"):
+            md_parser.parse("# 范围\n\n{脚注} 孤立脚注。\n")
+        with self.assertRaisesRegex(ValueError, "图表附加项内容不要写进"):
+            md_parser.parse("# 范围\n\n{表单位：单位为毫米。}\n")
+        with self.assertRaisesRegex(ValueError, "图注语法已移除"):
             md_parser.parse(
                 "# 范围\n\n"
                 "{表：#tbl:classify} 温泉利用分类\n\n"
@@ -262,11 +500,73 @@ class CrossReferenceParserTest(unittest.TestCase):
                 "| 医疗保健 |\n\n"
                 "{图注：类型不匹配。}\n"
             )
-        with self.assertRaisesRegex(ValueError, "表注必须紧跟表格"):
+        with self.assertRaisesRegex(ValueError, "图标引序号说明必须紧跟图片"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:classify} 温泉利用分类\n\n"
+                "| 项目 |\n"
+                "| --- |\n"
+                "| 医疗保健 |\n\n"
+                "{图标引} 类型不匹配。\n"
+            )
+        with self.assertRaisesRegex(ValueError, "图段必须紧跟图片"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:classify} 温泉利用分类\n\n"
+                "| 项目 |\n"
+                "| --- |\n"
+                "| 医疗保健 |\n\n"
+                "{图段} 类型不匹配。\n"
+            )
+        with self.assertRaisesRegex(ValueError, "分图组必须紧跟图片"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:classify} 温泉利用分类\n\n"
+                "| 项目 |\n"
+                "| --- |\n"
+                "| 医疗保健 |\n\n"
+                "{分图组:2}\n\n"
+                "![类型不匹配](missing.png)\n"
+            )
+        with self.assertRaisesRegex(ValueError, "分图语法已改为分图组"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "![流程图 {#fig:flow}](missing.png)\n\n"
+                "{分图：missing.png | 旧写法。}\n"
+            )
+        with self.assertRaisesRegex(ValueError, "分图组内容不要写进"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "![流程图 {#fig:flow}](missing.png)\n\n"
+                "{分图组：2 | ![旧写法](missing.png)}\n"
+            )
+        with self.assertRaisesRegex(ValueError, "图标引不再手写编号"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "![流程图 {#fig:flow}](missing.png)\n\n"
+                "{图标引1：旧写法。}\n"
+            )
+        with self.assertRaisesRegex(ValueError, "图段内容不要写进"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "![流程图 {#fig:flow}](missing.png)\n\n"
+                "{图段：旧写法。}\n"
+            )
+        with self.assertRaisesRegex(ValueError, "表注语法已移除"):
             md_parser.parse(
                 "# 范围\n\n"
                 "![流程图 {#fig:flow}](missing.png)\n\n"
                 "{表注：类型不匹配。}\n"
+            )
+        with self.assertRaisesRegex(ValueError, "单位只能写一次"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:classify} 温泉利用分类\n\n"
+                "| 项目 |\n"
+                "| --- |\n"
+                "| 医疗保健 |\n\n"
+                "{单位} 单位为毫米。\n\n"
+                "{单位} 单位为厘米。\n"
             )
 
     def test_addon_cross_references_are_validated(self):
@@ -276,8 +576,16 @@ class CrossReferenceParserTest(unittest.TestCase):
                 "{表：#tbl:classify} 温泉利用分类\n\n"
                 "| 项目 |\n"
                 "| --- |\n"
+                "| 医疗保健〔注：见{{fig:missing:label}}。〕 |\n"
+            )
+        with self.assertRaisesRegex(ValueError, "未知交叉引用"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:classify} 温泉利用分类\n\n"
+                "| 项目 |\n"
+                "| --- |\n"
                 "| 医疗保健 |\n\n"
-                "{表注：见{{fig:missing:label}}。}\n"
+                "{单位} 单位为{{fig:missing:label}}。\n"
             )
 
     def test_nested_ordered_list_is_kept_as_second_level(self):
@@ -392,10 +700,10 @@ class CrossReferenceParserTest(unittest.TestCase):
 class CrossReferenceDocxTest(unittest.TestCase):
     _W_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
-    def test_docx_uses_visible_builtin_seq_and_resets_appendix_tables(self):
-        xml = _build_docx_xml(
+    def test_docx_uses_template_caption_numbering_styles(self):
+        parts = _build_cover_docx_parts(
             "# 范围\n\n"
-            "见{{tbl:main:label}}，完整题名为{{tbl:main:full}}，按{{eq:rate:label}}计算。\n\n"
+            "见{{tbl:main:label}}，完整题名为{{tbl:main:full}}，编号{{tbl:main}}，按{{eq:rate:label}}计算。\n\n"
             "{表：#tbl:main} 主表\n\n"
             "| 项目 |\n"
             "| --- |\n"
@@ -412,23 +720,75 @@ class CrossReferenceDocxTest(unittest.TestCase):
             "| 项目 |\n"
             "| --- |\n"
             "| B |\n\n"
+            "![附录B图{#fig:appB}](missing.png)\n\n"
             "# 参考文献\n\n"
             "GB/T 1.1—2020　标准化工作导则\n"
         )
+        xml = parts["document"].decode("utf-8", errors="ignore")
+        root = ET.fromstring(parts["document"])
+        styles = parts["styles"]
 
-        self.assertIn(" SEQ 表 \\* ARABIC \\r 1 ", xml)
-        self.assertIn(" SEQ 图 \\* ARABIC \\r 1 ", xml)
+        self.assertNotIn("SEQ 表", xml)
+        self.assertNotIn("SEQ 图", xml)
         self.assertIn(" SEQ 公式 \\* ARABIC \\r 1 ", xml)
-        self.assertIn("<w:t>A.</w:t>", xml)
-        self.assertIn("<w:t>B.</w:t>", xml)
+        self.assertIn(" REF _Ref", xml)
+        self.assertIn("\\h \\r", xml)
+        self.assertIn("\\h \\n", xml)
+        self.assertIn('w:name="_Ref', xml)
+
+        body_table = self._et_paragraph_containing(root, "主表")
+        body_figure = self._et_paragraph_containing(root, "主图")
+        appendix_table = self._et_paragraph_containing(root, "附录B表")
+        appendix_figure = self._et_paragraph_containing(root, "附录B图")
+        self.assertEqual(
+            self._paragraph_style(body_table),
+            self._style_id_by_name(styles, "标准文件_正文表标题"),
+        )
+        self.assertEqual(
+            self._paragraph_style(body_figure),
+            self._style_id_by_name(styles, "标准文件_正文图标题"),
+        )
+        self.assertEqual(
+            self._paragraph_style(appendix_table),
+            self._style_id_by_name(styles, "标准文件_附录表标题"),
+        )
+        self.assertEqual(
+            self._paragraph_style(appendix_figure),
+            self._style_id_by_name(styles, "标准文件_附录图标题"),
+        )
+        for paragraph in (body_table, body_figure, appendix_table, appendix_figure):
+            self.assertIsNotNone(paragraph.find("w:pPr/w:numPr", self._W_NS))
+            self.assertNotEqual(self._num_id_value(paragraph), "0")
+        self.assertEqual(
+            self._numbering_level_format(parts, "标准文件_正文表标题"),
+            ("表%1", "nothing"),
+        )
+        self.assertEqual(
+            self._numbering_level_format(parts, "标准文件_正文图标题"),
+            ("图%1", "nothing"),
+        )
+        self.assertEqual(
+            self._numbering_level_format(parts, "标准文件_附录表标题"),
+            ("表%1.%2", "nothing"),
+        )
+        self.assertEqual(
+            self._numbering_level_format(parts, "标准文件_附录图标题"),
+            ("图%1.%2", "nothing"),
+        )
+
+        appendix_table_label = self._style_id_by_name(styles, "标准文件_附录表标号")
+        appendix_figure_label = self._style_id_by_name(styles, "标准文件_附录图标号")
+        hidden_table_labels = self._et_paragraphs_with_style(root, appendix_table_label)
+        hidden_figure_labels = self._et_paragraphs_with_style(root, appendix_figure_label)
+        self.assertEqual(len(hidden_table_labels), 2)
+        self.assertEqual(len(hidden_figure_labels), 2)
+        for paragraph in hidden_table_labels + hidden_figure_labels:
+            self.assertIsNotNone(paragraph.find("w:pPr/w:rPr/w:vanish", self._W_NS))
         self.assertNotIn("SEQ 表A", xml)
         self.assertNotIn("SEQ 表B", xml)
         self.assertNotIn("SEQ 图表", xml)
         self.assertNotIn("SEQ 公式A", xml)
         self.assertNotIn("SEQ 公式B", xml)
-        self.assertGreaterEqual(xml.count('<w:numId w:val="0"/>'), 3)
-        self.assertIn(" REF _Ref", xml)
-        self.assertIn('w:name="_Ref', xml)
         self.assertIn("<w:vanish", xml)
         self.assertIn("<w:hyperlink", xml)
 
@@ -548,32 +908,60 @@ class CrossReferenceDocxTest(unittest.TestCase):
             "# 范围\n\n"
             "![说明图 {#fig:flow}](missing.png)\n\n"
             "{表：#tbl:main} 测试表\n\n"
-            "| 项目 |\n"
-            "| --- |\n"
-            "| A |\n\n"
-            "{表注1：表注引用{{fig:flow:label}}。}\n\n"
-            "{表来源：表资料来源。}\n"
+            "| 项目 | 说明〔脚注〕 |\n"
+            "| --- | --- |\n"
+            "| A | 长文本说明应左对齐。〔注：单元格注引用{{fig:flow:label}}。〕〔注：第二条注。〕 |\n\n"
+            "{单位} 单位为毫米\n\n"
+            "{脚注} 表脚注的内容。\n\n"
+            "{来源} 表资料来源。\n"
         )
         xml = parts["document"].decode("utf-8", errors="ignore")
         root = ET.fromstring(parts["document"])
 
         caption_pos = xml.index("测试表")
+        unit_pos = xml.index("单位为毫米")
         table_pos = xml.index("<w:tbl", caption_pos)
-        note_pos = xml.index("表注引用")
+        table_end = xml.index("</w:tbl>", table_pos)
+        note_pos = xml.index("单元格注引用")
+        second_note_pos = xml.index("第二条注")
+        footnote_pos = xml.index("表脚注的内容")
         source_pos = xml.index("表资料来源")
 
-        self.assertLess(caption_pos, table_pos)
+        self.assertLess(caption_pos, unit_pos)
+        self.assertLess(unit_pos, table_pos)
         self.assertLess(table_pos, note_pos)
-        self.assertLess(note_pos, source_pos)
-        note_para = self._et_paragraph_containing(root, "表注引用")
+        self.assertLess(note_pos, second_note_pos)
+        self.assertLess(second_note_pos, footnote_pos)
+        self.assertLess(footnote_pos, source_pos)
+        self.assertLess(source_pos, table_end)
+        self.assertIn('<w:gridSpan w:val="2"', xml[table_pos:table_end])
+        unit_para = self._et_paragraph_containing(root, "单位为毫米")
+        note_para = self._et_paragraph_containing(root, "单元格注引用")
+        footnote_para = self._et_paragraph_containing(root, "表脚注的内容")
         source_para = self._et_paragraph_containing(root, "表资料来源")
-        note_style = self._style_id_by_name(parts["styles"], "标准文件_图表脚注")
-        note_content_style = self._style_id_by_name(parts["styles"], "标准文件_图表脚注内容")
+        note_style = self._style_id_by_name(parts["styles"], "标准文件_注×：")
+        footnote_style = self._style_id_by_name(parts["styles"], "标准文件_图表脚注")
+        footnote_content_style = self._style_id_by_name(parts["styles"], "标准文件_图表脚注内容")
         source_style = self._style_id_by_name(parts["styles"], "标准文件_图表说明")
+        note_row = self._et_table_row_containing(root, "单元格注引用")
+        footnote_row = self._et_table_row_containing(root, "表脚注的内容")
+        source_row = self._et_table_row_containing(root, "表资料来源")
 
+        self.assertEqual(self._jc_value(unit_para), "right")
+        self.assertIn("第二条注", self._et_text(note_row))
+        self.assertIsNot(note_row, source_row)
+        self.assertIsNot(note_row, footnote_row)
+        self.assertIsNot(footnote_row, source_row)
+        self.assertNotIn("〔脚注〕", xml[table_pos:table_end])
         self.assertEqual(self._paragraph_style(note_para), note_style)
+        self.assertEqual(self._paragraph_style(footnote_para), footnote_style)
         self.assertEqual(self._paragraph_style(source_para), source_style)
-        self.assertIsNotNone(note_para.find(f'.//w:rStyle[@w:val="{note_content_style}"]', self._W_NS))
+        self.assertIsNone(note_para.find(f'.//w:rStyle[@w:val="{footnote_content_style}"]', self._W_NS))
+        self.assertIsNone(footnote_para.find(f'.//w:rStyle[@w:val="{footnote_content_style}"]', self._W_NS))
+        self.assertIn(f'w:rStyle w:val="{footnote_content_style}"', xml[table_pos:table_end])
+        self.assertNotIn("注 1：", self._et_text(note_row))
+        self.assertNotIn("注 2：", self._et_text(note_row))
+        self.assertNotIn("a 表脚注", self._et_text(footnote_row))
         self.assertIn(" REF _Ref", xml[xml.rfind("<w:p", 0, note_pos):xml.index("</w:p>", note_pos)])
 
     def test_figure_addons_emit_after_caption_with_declared_styles(self):
@@ -584,30 +972,174 @@ class CrossReferenceDocxTest(unittest.TestCase):
             "| --- |\n"
             "| A |\n\n"
             "![测试图 {#fig:flow}](missing.png)\n\n"
-            "{图注：图注引用{{tbl:main:label}}。}\n\n"
-            "{图来源：图资料来源。}\n"
+            "{单位} 单位为毫米\n\n"
+            "{图标引} 说明的内容\n\n"
+            "{图标引} 说明的内容\n\n"
+            "{图段} 段（可包含要求型条款）〔注：图中的注的内容〕\n\n"
+            "{脚注} 图脚注的内容。\n\n"
+            "{来源} 图资料来源。\n"
         )
         xml = parts["document"].decode("utf-8", errors="ignore")
         root = ET.fromstring(parts["document"])
 
+        unit_pos = xml.index("单位为毫米")
         image_pos = xml.index("[缺少图片：missing.png]")
-        caption_pos = xml.index("测试图")
-        note_pos = xml.index("图注引用")
+        key_lead_pos = xml.index("标引序号说明")
+        key_item_pos = xml.index("说明的内容", key_lead_pos)
+        body_para_pos = xml.index("段（可包含要求型条款）")
+        note_pos = xml.index("图中的注的内容")
+        footnote_pos = xml.index("图脚注的内容")
         source_pos = xml.index("图资料来源")
+        caption_pos = xml.index("测试图")
 
-        self.assertLess(image_pos, caption_pos)
-        self.assertLess(caption_pos, note_pos)
-        self.assertLess(note_pos, source_pos)
-        note_para = self._et_paragraph_containing(root, "图注引用")
+        self.assertLess(unit_pos, image_pos)
+        self.assertLess(image_pos, key_lead_pos)
+        self.assertLess(key_lead_pos, key_item_pos)
+        self.assertLess(key_item_pos, body_para_pos)
+        self.assertLess(body_para_pos, note_pos)
+        self.assertLess(note_pos, footnote_pos)
+        self.assertLess(footnote_pos, source_pos)
+        self.assertLess(source_pos, caption_pos)
+        unit_para = self._et_paragraph_containing(root, "单位为毫米")
+        key_lead_para = self._et_paragraph_containing(root, "标引序号说明")
+        body_para = self._et_paragraph_containing(root, "段（可包含要求型条款）")
+        note_para = self._et_paragraph_containing(root, "图中的注的内容")
+        footnote_para = self._et_paragraph_containing(root, "图脚注的内容")
         source_para = self._et_paragraph_containing(root, "图资料来源")
-        note_style = self._style_id_by_name(parts["styles"], "标准文件_图表脚注")
-        note_content_style = self._style_id_by_name(parts["styles"], "标准文件_图表脚注内容")
+        para_style = self._style_id_by_name(parts["styles"], "标准文件_段")
+        note_style = self._style_id_by_name(parts["styles"], "标准文件_注：")
+        footnote_style = self._style_id_by_name(parts["styles"], "标准文件_图表脚注")
+        footnote_content_style = self._style_id_by_name(parts["styles"], "标准文件_图表脚注内容")
         source_style = self._style_id_by_name(parts["styles"], "标准文件_图表说明")
 
+        self.assertEqual(self._jc_value(unit_para), "right")
+        self.assertEqual(self._paragraph_style(key_lead_para), para_style)
+        self.assertEqual(self._paragraph_style(body_para), para_style)
         self.assertEqual(self._paragraph_style(note_para), note_style)
+        self.assertEqual(self._paragraph_style(footnote_para), footnote_style)
         self.assertEqual(self._paragraph_style(source_para), source_style)
-        self.assertIsNotNone(note_para.find(f'.//w:rStyle[@w:val="{note_content_style}"]', self._W_NS))
-        self.assertIn(" REF _Ref", xml[xml.rfind("<w:p", 0, note_pos):xml.index("</w:p>", note_pos)])
+        self.assertIsNone(footnote_para.find(f'.//w:rStyle[@w:val="{footnote_content_style}"]', self._W_NS))
+        self.assertIsNotNone(source_para.find("w:pPr/w:keepNext", self._W_NS))
+
+    def test_figure_image_is_constrained_to_body_width(self):
+        image_path = os.path.abspath(os.path.join("examples", "images", "subfigure-a.png"))
+        parts = _build_cover_docx_parts(
+            "# 范围\n\n"
+            f"![宽图 {{#fig:wide}}]({image_path})\n"
+        )
+        root = ET.fromstring(parts["document"])
+        inline = root.find(".//wp:inline", {
+            "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+        })
+        self.assertIsNotNone(inline)
+        extent = inline.find("wp:extent", {
+            "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+        })
+        self.assertIsNotNone(extent)
+        self.assertLessEqual(int(extent.get("cx")), 6120130)
+        image_para = self._et_paragraph_with_drawing(root)
+        spacing = image_para.find("w:pPr/w:spacing", self._W_NS)
+        self.assertIsNotNone(spacing)
+        self.assertEqual(spacing.get(self._w_tag("lineRule")), "auto")
+
+    def test_subfigures_are_composed_from_separate_images(self):
+        first = os.path.abspath(os.path.join("examples", "images", "subfigure-a.png"))
+        second = os.path.abspath(os.path.join("examples", "images", "subfigure-b.png"))
+        first_md = first.replace("\\", "/")
+        second_md = second.replace("\\", "/")
+        parts = _build_cover_docx_parts(
+            "# 范围\n\n"
+            "{图：#fig:subparts} 组合图\n\n"
+            "{分图组:2}\n\n"
+            f"![分图题一]({first_md})\n\n"
+            f"![分图题二]({second_md})\n"
+        )
+        xml = parts["document"].decode("utf-8", errors="ignore")
+        root = ET.fromstring(parts["document"])
+        wp_ns = {"wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"}
+        inlines = root.findall(".//wp:inline", wp_ns)
+
+        self.assertNotIn("[缺少图片：", xml)
+        self.assertGreaterEqual(len(inlines), 2)
+        self.assertIn("a)　分图题一", xml)
+        self.assertIn("b)　分图题二", xml)
+
+    def test_single_table_cell_note_uses_single_note_style(self):
+        parts = _build_cover_docx_parts(
+            "# 范围\n\n"
+            "{表：#tbl:single-note} 单注表\n\n"
+            "<table><tr><td colspan=\"2\">段（可包含要求型条款）〔注：单条注的内容〕</td></tr></table>\n"
+        )
+        root = ET.fromstring(parts["document"])
+        body_para = self._et_paragraph_containing(root, "段（可包含要求型条款）")
+        note_para = self._et_paragraph_containing(root, "单条注的内容")
+
+        self.assertEqual(
+            self._paragraph_style(body_para),
+            self._style_id_by_name(parts["styles"], "标准文件_段"),
+        )
+        self.assertEqual(
+            self._paragraph_style(note_para),
+            self._style_id_by_name(parts["styles"], "标准文件_注："),
+        )
+        self.assertIsNone(note_para.find("w:pPr/w:numPr", self._W_NS))
+        self.assertEqual(self._ind_value(body_para, "firstLine"), "199")
+        self.assertEqual(self._ind_value(body_para, "firstLineChars"), "95")
+
+    def test_official_table_sample_keeps_body_row_and_notes_in_one_cell(self):
+        parts = _build_cover_docx_parts(
+            "# 范围\n\n"
+            "{表：#tbl:sample} 表题\n\n"
+            "<table><tr><th>类型</th><th>长度</th><th>内圆直径〔脚注〕</th><th>外圆直径</th></tr>"
+            "<tr><td>A</td><td>230</td><td>100</td><td>125</td></tr>"
+            "<tr><td>……</td><td>……</td><td>……</td><td>……</td></tr>"
+            "<tr><td colspan=\"4\">段（可包含要求型条款）"
+            "〔注：表中的注的内容〕〔注：表中的注的内容〕</td></tr></table>\n\n"
+            "{单位} 单位为毫米\n\n"
+            "{脚注} 表脚注的内容\n"
+        )
+        xml = parts["document"].decode("utf-8", errors="ignore")
+        root = ET.fromstring(parts["document"])
+        table_pos = xml.index("<w:tbl", xml.index("表题"))
+        table_end = xml.index("</w:tbl>", table_pos)
+        table_xml = xml[table_pos:table_end]
+
+        self.assertNotIn("〔脚注〕", table_xml)
+        self.assertEqual(table_xml.count("<w:tr>"), 5)
+        body_note_row = self._et_table_row_containing(root, "段（可包含要求型条款）")
+        footnote_row = self._et_table_row_containing(root, "表脚注的内容")
+        body_para = self._et_paragraph_containing(root, "段（可包含要求型条款）")
+        first_note_para = self._et_paragraph_containing(root, "表中的注的内容")
+        body_style = self._style_id_by_name(parts["styles"], "标准文件_段")
+        note_style = self._style_id_by_name(parts["styles"], "标准文件_注×：")
+        footnote_style = self._style_id_by_name(parts["styles"], "标准文件_图表脚注")
+
+        self.assertEqual(self._paragraph_style(body_para), body_style)
+        self.assertEqual(self._paragraph_style(first_note_para), note_style)
+        self.assertEqual(self._ind_value(body_para, "firstLine"), "199")
+        self.assertEqual(self._ind_value(body_para, "firstLineChars"), "95")
+        self.assertNotIn("注 1：", self._et_text(body_note_row))
+        self.assertNotIn("注 2：", self._et_text(body_note_row))
+        self.assertNotIn("表脚注的内容", self._et_text(body_note_row))
+        self.assertIsNot(body_note_row, footnote_row)
+        footnote_para = self._et_paragraph_containing(root, "表脚注的内容")
+        self.assertEqual(self._paragraph_style(footnote_para), footnote_style)
+
+    def test_standalone_table_cell_note_does_not_emit_empty_body_paragraph(self):
+        parts = _build_cover_docx_parts(
+            "# 范围\n\n"
+            "{表：#tbl:standalone-note} 单独注表\n\n"
+            "<table><tr><td colspan=\"2\">〔注：单独注的内容〕</td></tr></table>\n"
+        )
+        root = ET.fromstring(parts["document"])
+        row = self._et_table_row_containing(root, "单独注的内容")
+        paras = row.findall(".//w:p", self._W_NS)
+        note_para = self._et_paragraph_containing(root, "单独注的内容")
+        note_style = self._style_id_by_name(parts["styles"], "标准文件_注：")
+
+        self.assertEqual(len(paras), 1)
+        self.assertEqual(self._paragraph_style(note_para), note_style)
+        self.assertEqual(self._et_text(row), "单独注的内容")
 
     def test_appendix_starts_on_new_page(self):
         xml = _build_docx_xml(
@@ -728,7 +1260,7 @@ class CrossReferenceDocxTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "索引项必须写成"):
             md_parser.parse("# 范围\n\n正文。\n\n# 索引\n\n## B\n\n- 标准 3.1\n")
 
-    def test_caption_label_bookmarks_include_complete_seq_field(self):
+    def test_caption_bookmarks_attach_to_style_numbered_paragraphs(self):
         xml = _build_docx_xml(
             "# 范围\n\n"
             "{表：#tbl:main} 正文表\n\n"
@@ -749,19 +1281,23 @@ class CrossReferenceDocxTest(unittest.TestCase):
             "GB/T 1.1—2020　标准化工作导则\n"
         )
 
-        for anchor_id, title, prefix in (("main", "正文表", None), ("appB", "附录B表", "B.")):
+        for anchor_id, title in (("main", "正文表"), ("appB", "附录B表")):
             para = self._paragraph_containing(xml, title)
             label_name = docx_builder._native_ref_name("tbl", anchor_id, "label")
             num_name = docx_builder._native_ref_name("tbl", anchor_id, "num")
+            full_name = docx_builder._native_ref_name("tbl", anchor_id, "full")
+            text_name = docx_builder._native_ref_name("tbl", anchor_id, "text")
             label_id = self._bookmark_id(para, label_name)
             num_id = self._bookmark_id(para, num_name)
+            full_id = self._bookmark_id(para, full_name)
+            text_id = self._bookmark_id(para, text_name)
 
-            field_end = para.index('<w:fldChar w:fldCharType="end"/>')
-            self.assertLess(para.index("<w:t>表</w:t>"), field_end)
-            if prefix is not None:
-                self.assertLess(para.index(f"<w:t>{prefix}</w:t>"), field_end)
-            self.assertGreater(para.index(f'<w:bookmarkEnd w:id="{label_id}"/>'), field_end)
-            self.assertGreater(para.index(f'<w:bookmarkEnd w:id="{num_id}"/>'), field_end)
+            self.assertNotIn("SEQ 表", para)
+            self.assertNotIn("<w:t>表</w:t>", para)
+            self.assertIn("<w:numPr>", para)
+            title_pos = para.index(f"<w:t>{title}</w:t>")
+            for bid in (label_id, num_id, full_id, text_id):
+                self.assertGreater(para.index(f'<w:bookmarkEnd w:id="{bid}"/>'), title_pos)
 
     def test_nested_ordered_list_uses_template_multilevel_numbering(self):
         xml = _build_docx_xml(
@@ -864,6 +1400,26 @@ class CrossReferenceDocxTest(unittest.TestCase):
                 return paragraph
         return None
 
+    def _et_paragraphs_with_style(self, root, style_id: str):
+        paragraphs = []
+        for paragraph in root.findall(".//w:p", self._W_NS):
+            pstyle = paragraph.find("w:pPr/w:pStyle", self._W_NS)
+            if pstyle is not None and pstyle.get(self._w_tag("val")) == style_id:
+                paragraphs.append(paragraph)
+        return paragraphs
+
+    def _et_table_row_containing(self, root, text: str):
+        for row in root.findall(".//w:tr", self._W_NS):
+            if text in self._et_text(row):
+                return row
+        return None
+
+    def _et_paragraph_with_drawing(self, root):
+        for paragraph in root.findall(".//w:p", self._W_NS):
+            if paragraph.find(".//w:drawing", self._W_NS) is not None:
+                return paragraph
+        return None
+
     def _et_text(self, element) -> str:
         return "".join(t.text or "" for t in element.findall(".//w:t", self._W_NS))
 
@@ -885,9 +1441,52 @@ class CrossReferenceDocxTest(unittest.TestCase):
                 return style.get(self._w_tag("styleId"))
         self.fail("找不到样式：%s" % name)
 
+    def _numbering_level_format(self, parts: dict, style_name: str) -> tuple:
+        styles_root = ET.fromstring(parts["styles"])
+        numbering_root = ET.fromstring(parts["numbering"])
+        style_num_id = None
+        style_ilvl = "0"
+        for style in styles_root.findall("w:style", self._W_NS):
+            name_el = style.find("w:name", self._W_NS)
+            if name_el is None or name_el.get(self._w_tag("val")) != style_name:
+                continue
+            num_id = style.find("w:pPr/w:numPr/w:numId", self._W_NS)
+            ilvl = style.find("w:pPr/w:numPr/w:ilvl", self._W_NS)
+            self.assertIsNotNone(num_id)
+            style_num_id = num_id.get(self._w_tag("val"))
+            style_ilvl = ilvl.get(self._w_tag("val")) if ilvl is not None else "0"
+            break
+        self.assertIsNotNone(style_num_id)
+        abstract_id = None
+        for num in numbering_root.findall("w:num", self._W_NS):
+            if num.get(self._w_tag("numId")) != style_num_id:
+                continue
+            abstract = num.find("w:abstractNumId", self._W_NS)
+            self.assertIsNotNone(abstract)
+            abstract_id = abstract.get(self._w_tag("val"))
+            break
+        self.assertIsNotNone(abstract_id)
+        for abstract in numbering_root.findall("w:abstractNum", self._W_NS):
+            if abstract.get(self._w_tag("abstractNumId")) != abstract_id:
+                continue
+            for level in abstract.findall("w:lvl", self._W_NS):
+                if level.get(self._w_tag("ilvl")) != style_ilvl:
+                    continue
+                lvl_text = level.find("w:lvlText", self._W_NS)
+                suff = level.find("w:suff", self._W_NS)
+                return (
+                    lvl_text.get(self._w_tag("val")) if lvl_text is not None else "",
+                    suff.get(self._w_tag("val")) if suff is not None else "",
+                )
+        self.fail("找不到编号级别：%s" % style_name)
+
     def _jc_value(self, paragraph) -> str:
         jc = paragraph.find("w:pPr/w:jc", self._W_NS)
         return jc.get(self._w_tag("val")) if jc is not None else ""
+
+    def _ind_value(self, paragraph, name: str) -> str:
+        ind = paragraph.find("w:pPr/w:ind", self._W_NS)
+        return ind.get(self._w_tag(name)) if ind is not None else ""
 
     def _w_tag(self, name: str) -> str:
         return "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}" + name
@@ -1268,7 +1867,7 @@ class CoverBackendDocxTest(unittest.TestCase):
         self.assertNotIn("点击此处添加与国际标准一致性程度的标识", xml)
 
     def test_cover_backend_keeps_seq_groups_and_appendix_scope(self):
-        xml = _build_cover_docx_xml(
+        parts = _build_cover_docx_parts(
             "# 范围\n\n"
             "见{{tbl:main:label}}，按{{eq:rate:label}}计算。\n\n"
             "{表：#tbl:main} 主表\n\n"
@@ -1287,11 +1886,31 @@ class CoverBackendDocxTest(unittest.TestCase):
             "| --- |\n"
             "| B |\n"
         )
+        xml = parts["document"].decode("utf-8", errors="ignore")
+        root = ET.fromstring(parts["document"])
+        body_table = self._et_paragraph_containing(root, "主表")
+        appendix_table = self._et_paragraph_containing(root, "附录B表")
+        table_label_style = self._style_id_by_name(parts["styles"], "标准文件_附录表标号")
+        figure_label_style = self._style_id_by_name(parts["styles"], "标准文件_附录图标号")
 
-        self.assertIn(" SEQ 表 \\* ARABIC \\r 1 ", xml)
+        self.assertNotIn("SEQ 表", xml)
+        self.assertNotIn("SEQ 图", xml)
         self.assertIn(" SEQ 公式 \\* ARABIC \\r 1 ", xml)
-        self.assertIn("<w:t>A.</w:t>", xml)
-        self.assertIn("<w:t>B.</w:t>", xml)
+        self.assertIn("\\h \\r", xml)
+        self.assertEqual(
+            self._paragraph_style(body_table),
+            self._style_id_by_name(parts["styles"], "标准文件_正文表标题"),
+        )
+        self.assertEqual(
+            self._paragraph_style(appendix_table),
+            self._style_id_by_name(parts["styles"], "标准文件_附录表标题"),
+        )
+        self.assertNotEqual(self._num_id_value(body_table), "0")
+        self.assertNotEqual(self._num_id_value(appendix_table), "0")
+        self.assertEqual(len(self._et_paragraphs_with_style(root, table_label_style)), 2)
+        self.assertEqual(len(self._et_paragraphs_with_style(root, figure_label_style)), 2)
+        self.assertNotIn("<w:t>A.</w:t>", xml)
+        self.assertNotIn("<w:t>B.</w:t>", xml)
         self.assertNotIn("SEQ TableA", xml)
         self.assertNotIn("SEQ TableB", xml)
         self.assertNotIn("SEQ Equation", xml)
@@ -1406,31 +2025,72 @@ class CoverBackendDocxTest(unittest.TestCase):
         self.assertIn("<w:jc w:val=\"center\"/>", xml)
         self.assertIn("<w:jc w:val=\"left\"/>", xml)
 
+    def test_docx_html_table_rowspan_borders_empty_and_same(self):
+        xml = _build_docx_xml(
+            "# 范围\n\n"
+            "示例：\n\n"
+            "第一段示例内容。\n\n"
+            "{表：#tbl:merge} 合并边框表\n\n"
+            "<table data-border-outer=\"thick\" data-border-inner=\"thin\">"
+            "<tr><th rowspan=\"2\" data-border-right=\"thick\">类别</th><th colspan=\"2\">指标</th></tr>"
+            "<tr><th>值</th><th data-border-bottom=\"none\">备注</th></tr>"
+            "<tr><td>一类</td><td></td><td>同上</td></tr>"
+            "</table>\n\n"
+            "第二段示例内容。\n\n"
+            "{示例结束}\n"
+        )
+
+        self.assertIn('<w:vMerge w:val="restart"', xml)
+        self.assertIn("<w:vMerge/>", xml)
+        self.assertIn('<w:gridSpan w:val="2"', xml)
+        self.assertIn('<w:right w:val="single" w:sz="8"', xml)
+        self.assertIn('<w:bottom w:val="nil" w:sz="0"', xml)
+        self.assertIn(">同上<", xml)
+        self.assertIn("第一段示例内容", xml)
+        self.assertIn("第二段示例内容", xml)
+        self.assertGreaterEqual(xml.count('w:pStyle w:val="182"'), 2)
+
     def test_docx_moderate_table_is_not_split_as_continued_table(self):
         rows = "".join("| %d | 值%d |\n" % (i, i) for i in range(1, 8))
-        xml = _build_docx_xml(
+        parts = _build_docx_parts(
             "# 范围\n\n"
             "{表：#tbl:moderate} 中等表\n\n"
             "| 项 | 值 |\n"
             "| --- | --- |\n" +
             rows
         )
+        xml = parts["document"].decode("utf-8", errors="ignore")
+        root = ET.fromstring(parts["document"])
+        caption = self._et_paragraph_containing(root, "中等表")
 
-        self.assertEqual(xml.count(" SEQ 表 "), 1)
+        self.assertNotIn("SEQ 表", xml)
+        self.assertEqual(
+            self._paragraph_style(caption),
+            self._style_id_by_name(parts["styles"], "标准文件_正文表标题"),
+        )
+        self.assertNotEqual(self._num_id_value(caption), "0")
         self.assertNotIn("（续）", xml)
         self.assertEqual(xml.count("<w:tblHeader w:val=\"true\"/>"), 1)
 
     def test_docx_long_table_is_not_split_before_render_pagination(self):
         rows = "".join("| %d | 值%d |\n" % (i, i) for i in range(1, 14))
-        xml = _build_docx_xml(
+        parts = _build_docx_parts(
             "# 范围\n\n"
             "{表：#tbl:long} 长表\n\n"
             "| 项 | 值 |\n"
             "| --- | --- |\n" +
             rows
         )
+        xml = parts["document"].decode("utf-8", errors="ignore")
+        root = ET.fromstring(parts["document"])
+        caption = self._et_paragraph_containing(root, "长表")
 
-        self.assertEqual(xml.count(" SEQ 表 "), 1)
+        self.assertNotIn("SEQ 表", xml)
+        self.assertEqual(
+            self._paragraph_style(caption),
+            self._style_id_by_name(parts["styles"], "标准文件_正文表标题"),
+        )
+        self.assertNotEqual(self._num_id_value(caption), "0")
         self.assertNotIn("（续）", xml)
         self.assertEqual(xml.count("<w:tblHeader w:val=\"true\"/>"), 1)
 
@@ -1466,7 +2126,7 @@ class CoverBackendDocxTest(unittest.TestCase):
         self.assertTrue(changed)
         self.assertIn("表1　测试表（续）", xml)
         self.assertIn('w:pStyle w:val="185"', xml)
-        self.assertEqual(xml.count(" SEQ 表 "), 1)
+        self.assertNotIn("SEQ 表", xml)
         self.assertEqual(xml.count("唯一表头"), 2)
         root = ET.fromstring(xml)
         self.assertEqual(len(root.findall(".//w:tblHeader", self._W_NS)), 2)
@@ -1507,6 +2167,14 @@ class CoverBackendDocxTest(unittest.TestCase):
                 return paragraph
         return None
 
+    def _et_paragraphs_with_style(self, root, style_id: str):
+        paragraphs = []
+        for paragraph in root.findall(".//w:p", self._W_NS):
+            pstyle = paragraph.find("w:pPr/w:pStyle", self._W_NS)
+            if pstyle is not None and pstyle.get(self._w_tag("val")) == style_id:
+                paragraphs.append(paragraph)
+        return paragraphs
+
     def _et_paragraph_exact(self, root, text: str):
         for paragraph in root.findall(".//w:p", self._W_NS):
             if self._et_text(paragraph) == text:
@@ -1516,6 +2184,24 @@ class CoverBackendDocxTest(unittest.TestCase):
     def _jc_value(self, paragraph) -> str:
         jc = paragraph.find("w:pPr/w:jc", self._W_NS)
         return jc.get(self._w_tag("val")) if jc is not None else ""
+
+    def _num_id_value(self, paragraph) -> str:
+        num_id = paragraph.find("w:pPr/w:numPr/w:numId", self._W_NS)
+        self.assertIsNotNone(num_id)
+        return num_id.get(self._w_tag("val"))
+
+    def _paragraph_style(self, paragraph) -> str:
+        pstyle = paragraph.find("w:pPr/w:pStyle", self._W_NS)
+        self.assertIsNotNone(pstyle)
+        return pstyle.get(self._w_tag("val"))
+
+    def _style_id_by_name(self, styles_xml: bytes, name: str) -> str:
+        root = ET.fromstring(styles_xml)
+        for style in root.findall("w:style", self._W_NS):
+            name_el = style.find("w:name", self._W_NS)
+            if name_el is not None and name_el.get(self._w_tag("val")) == name:
+                return style.get(self._w_tag("styleId"))
+        self.fail("找不到样式：%s" % name)
 
     def _w_tag(self, name: str) -> str:
         return "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}" + name

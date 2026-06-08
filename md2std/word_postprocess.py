@@ -259,8 +259,15 @@ def _collect_table_continuation_plans(doc) -> List[_TableContinuationPlan]:
 
 def _table_caption_text(doc, table) -> str:
     before = doc.Range(0, table.Range.Start)
-    text = before.Paragraphs.Last.Range.Text
-    return _clean_word_text(text)
+    para = before.Paragraphs.Last
+    text = _clean_word_text(para.Range.Text)
+    try:
+        list_string = _clean_word_text(para.Range.ListFormat.ListString)
+    except Exception:
+        list_string = ""
+    if list_string:
+        return (list_string + "　" + text).strip()
+    return text
 
 
 def _clean_word_text(text: str) -> str:

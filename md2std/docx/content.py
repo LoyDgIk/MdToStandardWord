@@ -141,11 +141,30 @@ def _emit_term_entry(anchor: Paragraph, doc, term: model.Term):
     _emit_term_title(anchor, doc, term.term, term.term_en)
     if term.definition:
         _new_paragraph_before(anchor, doc, S.S_PARA, spans=term.definition)
-    for note in term.notes:
-        style = S.S_NOTE_X if note.index else S.S_NOTE
-        _new_paragraph_before(anchor, doc, style, spans=note.spans)
+    _emit_note_group(anchor, doc, term.notes)
     if term.source is not None:
         _emit_source(anchor, doc, term.source)
+
+
+def _note_group_requires_numbering(notes: List[model.Note]) -> bool:
+    return len(notes) > 1 or any(note.index is not None for note in notes)
+
+
+def _emit_note_group(anchor: Paragraph, doc, notes: List[model.Note]):
+    if not notes:
+        return
+    if not _note_group_requires_numbering(notes):
+        _new_paragraph_before(anchor, doc, S.S_NOTE, spans=notes[0].spans)
+        return
+    num_id = _new_numbering_instance_from_style(doc, S.S_NOTE_X)
+    for note in notes:
+        _new_numbered_style_paragraph(
+            anchor,
+            doc,
+            S.S_NOTE_X,
+            spans=note.spans,
+            num_id_override=num_id,
+        )
 
 
 def _emit_body_block(anchor: Paragraph, doc, blk, in_terms=False, in_normrefs=False,
@@ -173,8 +192,7 @@ def _emit_body_block(anchor: Paragraph, doc, blk, in_terms=False, in_normrefs=Fa
         if seg in S.UNTITLED_STYLE_BY_SEGMENTS:
             _set_numbering(para, S.NUM_BODY, seg)
     elif isinstance(blk, model.Note):
-        style = S.S_NOTE_X if blk.index else S.S_NOTE
-        _new_paragraph_before(anchor, doc, style, spans=blk.spans)
+        _emit_note_group(anchor, doc, [blk])
     elif isinstance(blk, model.Example):
         style = S.S_EXAMPLE
         _new_paragraph_before(anchor, doc, style, spans=blk.spans)
@@ -258,43 +276,26 @@ def _add_bookmark_ends_after(run, bids):
         _bookmark_end_after(run, bid)
 
 
-def _emit_visible_caption(para: Paragraph, ref_type: str, seq_name: str,
-                          label_text: str, anchor_id: str, title: str,
-                          appendix_letter=None):
-    """输出 `表1　标题` / `图A.1　标题`，并建立 num/label/full 书签。"""
-    label_run = para.add_run(label_text)
-    bm_full_id = bm_label_id = bm_num_id = bm_text_id = None
-    if anchor_id:
-        bm_full_id = _next_bm_id()
-        bm_label_id = _next_bm_id()
-        bm_num_id = _next_bm_id()
-        bm_text_id = _next_bm_id() if title else None
-        _bookmark_start_before(label_run, _native_ref_name(ref_type, anchor_id, "full"), bm_full_id)
-        _bookmark_start_before(label_run, _native_ref_name(ref_type, anchor_id, "label"), bm_label_id)
-
-    prefix_run = None
-    if appendix_letter:
-        prefix_run = para.add_run(appendix_letter + ".")
-    result_run, seq_end_run = _add_seq(para, seq_name, reset=_needs_seq_reset(ref_type, appendix_letter))
-
-    if anchor_id:
-        _bookmark_start_before(prefix_run or result_run, _native_ref_name(ref_type, anchor_id, "num"), bm_num_id)
-
-    title_run = None
+def _emit_style_numbered_caption(para: Paragraph, doc, style_name: str,
+                                 ref_type: str, anchor_id: str, title: str):
+    """用模板标题样式的自动编号输出表/图题，并建立交叉引用书签。"""
+    _normalize_caption_numbering_separator(doc, style_name)
+    _set_numbering_from_style(para, doc, style_name)
     if title:
         para.add_run("　")
-        title_run = para.add_run(title)
-        if anchor_id and bm_text_id is not None:
-            _bookmark_start_before(title_run, _native_ref_name(ref_type, anchor_id, "text"), bm_text_id)
+    title_run = para.add_run(title or "")
+    if not anchor_id:
+        return
 
-    if anchor_id:
-        if title_run is not None:
-            _add_bookmark_ends_after(seq_end_run, [bm_num_id, bm_label_id])
-            if bm_text_id is not None:
-                _bookmark_end_after(title_run, bm_text_id)
-            _bookmark_end_after(title_run, bm_full_id)
-        else:
-            _add_bookmark_ends_after(seq_end_run, [bm_num_id, bm_label_id, bm_full_id])
+    bookmark_ids = [
+        (_native_ref_name(ref_type, anchor_id, "full"), _next_bm_id()),
+        (_native_ref_name(ref_type, anchor_id, "label"), _next_bm_id()),
+        (_native_ref_name(ref_type, anchor_id, "num"), _next_bm_id()),
+        (_native_ref_name(ref_type, anchor_id, "text"), _next_bm_id()),
+    ]
+    for name, bid in bookmark_ids:
+        _bookmark_start_before(title_run, name, bid)
+    _add_bookmark_ends_after(title_run, [bid for _, bid in bookmark_ids])
 
 
 def _apply_character_style(doc, run, style_name: str):
@@ -335,10 +336,31 @@ def _add_character_styled_runs(paragraph: Paragraph, doc, style_name: str,
                     run.font.superscript = True
 
 
-def _emit_figure_table_note(anchor: Paragraph, doc, note: model.Note):
+def _footnote_ref_label(index: int) -> str:
+    """Return a, b, ..., z, aa, ab... for generated table footnote references."""
+    letters = []
+    value = max(0, index)
+    while True:
+        value, rem = divmod(value, 26)
+        letters.append(chr(ord("a") + rem))
+        if value == 0:
+            break
+        value -= 1
+    return "".join(reversed(letters))
+
+
+def _emit_footnote_runs(para: Paragraph, doc, footnote: model.FigureTableFootnote,
+                        num_id: Optional[int] = None):
+    _set_paragraph_style(doc, para, S.S_FIG_TABLE_NOTE)
+    _set_numbering_from_style(para, doc, S.S_FIG_TABLE_NOTE, num_id_override=num_id)
+    _set_runs(para, footnote.spans)
+
+
+def _emit_figure_table_footnote(anchor: Paragraph, doc, footnote: model.FigureTableFootnote,
+                                num_id: Optional[int] = None):
     para = _new_paragraph_before(anchor, doc, S.S_FIG_TABLE_NOTE)
-    para.add_run("注%d：" % note.index if note.index else "注：")
-    _add_character_styled_runs(para, doc, S.S_FIG_TABLE_NOTE_CONTENT, note.spans)
+    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    _emit_footnote_runs(para, doc, footnote, num_id=num_id)
 
 
 def _emit_figure_table_source(anchor: Paragraph, doc, source: model.FigureTableSource):
@@ -347,12 +369,228 @@ def _emit_figure_table_source(anchor: Paragraph, doc, source: model.FigureTableS
     _set_runs(para, source.spans)
 
 
-def _emit_figure_table_addons(anchor: Paragraph, doc, obj):
-    for note in getattr(obj, "notes", []) or []:
-        _emit_figure_table_note(anchor, doc, note)
-    source = getattr(obj, "source", None)
-    if source is not None:
-        _emit_figure_table_source(anchor, doc, source)
+def _emit_figure_table_unit(anchor: Paragraph, doc, unit: model.FigureTableSource):
+    para = _new_paragraph_before(anchor, doc, S.S_FIG_TABLE_SOURCE)
+    para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    _set_runs(para, unit.spans)
+
+
+def _set_keep_next_on_paragraph_element(p):
+    if p is None or p.tag != qn("w:p"):
+        return
+    ppr = p.find(qn("w:pPr"))
+    if ppr is None:
+        ppr = OxmlElement("w:pPr")
+        p.insert(0, ppr)
+    if ppr.find(qn("w:keepNext")) is None:
+        ppr.append(OxmlElement("w:keepNext"))
+
+
+def _keep_previous_block_with_paragraph(para: Paragraph):
+    prev = para._p.getprevious()
+    if prev is None:
+        return
+    if prev.tag == qn("w:p"):
+        _set_keep_next_on_paragraph_element(prev)
+        return
+    if prev.tag == qn("w:tbl"):
+        paragraphs = list(prev.iter(qn("w:p")))
+        if paragraphs:
+            _set_keep_next_on_paragraph_element(paragraphs[-1])
+
+
+def _collapse_hidden_paragraph(para: Paragraph):
+    ppr = para._p.get_or_add_pPr()
+    spacing = ppr.find(qn("w:spacing"))
+    if spacing is None:
+        spacing = OxmlElement("w:spacing")
+        ppr.append(spacing)
+    spacing.set(qn("w:before"), "0")
+    spacing.set(qn("w:after"), "0")
+    spacing.set(qn("w:line"), "1")
+    spacing.set(qn("w:lineRule"), "exact")
+
+
+def _emit_hidden_appendix_caption_label(anchor: Paragraph, doc, style_name: str):
+    para = _new_paragraph_before(anchor, doc, style_name)
+    _set_numbering_from_style(para, doc, style_name)
+    _make_paragraph_hidden(para)
+    _collapse_hidden_paragraph(para)
+
+
+def _available_figure_width_emu(doc) -> int:
+    fallback = 9360 * 635
+    for section in reversed(doc.sections):
+        usable = int(section.page_width - section.left_margin - section.right_margin)
+        if usable > 0:
+            return usable
+    return fallback
+
+
+def _fit_inline_shape_to_width(shape, max_width_emu: int):
+    if max_width_emu <= 0 or int(shape.width) <= max_width_emu:
+        return
+    scale = max_width_emu / float(shape.width)
+    shape.width = max_width_emu
+    shape.height = int(shape.height * scale)
+
+
+def _format_figure_image_paragraph(para: Paragraph):
+    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    ppr = para._p.get_or_add_pPr()
+    spacing = ppr.find(qn("w:spacing"))
+    if spacing is None:
+        spacing = OxmlElement("w:spacing")
+        ppr.append(spacing)
+    spacing.set(qn("w:line"), "240")
+    spacing.set(qn("w:lineRule"), "auto")
+    spacing.set(qn("w:before"), "120")
+    spacing.set(qn("w:after"), "120")
+
+
+def _emu_to_twips(value: int) -> int:
+    return max(1, int(value / 635))
+
+
+def _set_table_width(table, width_emu: int):
+    tblpr = table._tbl.find(qn("w:tblPr"))
+    if tblpr is None:
+        tblpr = OxmlElement("w:tblPr")
+        table._tbl.insert(0, tblpr)
+    old = tblpr.find(qn("w:tblW"))
+    if old is not None:
+        tblpr.remove(old)
+    tblw = OxmlElement("w:tblW")
+    tblw.set(qn("w:w"), str(_emu_to_twips(width_emu)))
+    tblw.set(qn("w:type"), "dxa")
+    tblpr.append(tblw)
+
+
+def _set_cell_width(cell, width_emu: int):
+    tcpr = cell._tc.get_or_add_tcPr()
+    old = tcpr.find(qn("w:tcW"))
+    if old is not None:
+        tcpr.remove(old)
+    tcw = OxmlElement("w:tcW")
+    tcw.set(qn("w:w"), str(_emu_to_twips(width_emu)))
+    tcw.set(qn("w:type"), "dxa")
+    tcpr.append(tcw)
+
+
+def _set_table_no_borders(table):
+    tblpr = table._tbl.find(qn("w:tblPr"))
+    if tblpr is None:
+        tblpr = OxmlElement("w:tblPr")
+        table._tbl.insert(0, tblpr)
+    old = tblpr.find(qn("w:tblBorders"))
+    if old is not None:
+        tblpr.remove(old)
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        node = OxmlElement("w:" + edge)
+        node.set(qn("w:val"), "nil")
+        node.set(qn("w:sz"), "0")
+        node.set(qn("w:space"), "0")
+        node.set(qn("w:color"), "auto")
+        borders.append(node)
+    tblpr.append(borders)
+
+
+def _emit_subfigure_cell(cell, doc, subfig: model.FigureSubfigure, max_width_emu: int):
+    _set_cell_vertical_center(cell)
+    _set_cell_margins(cell, top=40, bottom=40, left=60, right=60)
+    para = _reset_cell_to_single_paragraph(cell, doc, S.S_NORMAL)
+    _format_figure_image_paragraph(para)
+    if subfig.path and os.path.isfile(subfig.path):
+        try:
+            shape = para.add_run().add_picture(subfig.path)
+            _fit_inline_shape_to_width(shape, max_width_emu)
+            return
+        except Exception:
+            pass
+    para.add_run("[缺少图片：%s]" % subfig.path)
+
+
+def _emit_subfigure_caption_cell(cell, doc, label: str, caption: str):
+    _set_cell_vertical_center(cell)
+    _set_cell_margins(cell, top=0, bottom=80, left=60, right=60)
+    para = _reset_cell_to_single_paragraph(cell, doc, S.S_NORMAL)
+    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    text = label + ")"
+    if caption:
+        text += "　" + caption
+    para.add_run(text)
+
+
+def _emit_subfigures(anchor: Paragraph, doc, subfigures: List[model.FigureSubfigure],
+                     columns: int = 0):
+    if not subfigures:
+        return
+    cols = columns if columns > 0 else (1 if len(subfigures) == 1 else 2)
+    cols = max(1, min(cols, len(subfigures)))
+    usable_width = _available_figure_width_emu(doc)
+    cell_width = int(usable_width / cols)
+    image_max_width = max(1, cell_width - 220000)
+    table = doc.add_table(rows=0, cols=cols)
+    _set_table_width(table, usable_width)
+    _set_table_no_borders(table)
+
+    for start in range(0, len(subfigures), cols):
+        chunk = subfigures[start:start + cols]
+        image_row = table.add_row()
+        caption_row = table.add_row()
+        for c_i in range(cols):
+            image_cell = image_row.cells[c_i]
+            caption_cell = caption_row.cells[c_i]
+            _set_cell_width(image_cell, cell_width)
+            _set_cell_width(caption_cell, cell_width)
+            if c_i < len(chunk):
+                subfig = chunk[c_i]
+                _emit_subfigure_cell(image_cell, doc, subfig, image_max_width)
+                label = _footnote_ref_label(start + c_i)
+                _emit_subfigure_caption_cell(caption_cell, doc, label, subfig.caption)
+            else:
+                image_cell.text = ""
+                caption_cell.text = ""
+    anchor._p.addprevious(table._tbl)
+
+
+def _format_figure_body_paragraph(para: Paragraph):
+    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    _set_paragraph_left_indent(para, 0)
+
+
+def _emit_figure_key_items(anchor: Paragraph, doc, items: List[model.FigureKeyItem]):
+    if not items:
+        return
+    lead = _new_paragraph_before(anchor, doc, S.S_PARA, text="标引序号说明：")
+    _format_figure_body_paragraph(lead)
+    for item in items:
+        para = _new_paragraph_before(anchor, doc, S.S_PARA)
+        _format_figure_body_paragraph(para)
+        para.add_run(item.index)
+        para.add_run("——")
+        _set_runs(para, item.spans)
+
+
+def _emit_figure_body_paragraphs(anchor: Paragraph, doc, paragraphs: List[model.FigureBodyParagraph]):
+    for fig_para in paragraphs:
+        para = _new_paragraph_before(anchor, doc, S.S_PARA, spans=fig_para.spans)
+        _format_figure_body_paragraph(para)
+        _emit_note_group(anchor, doc, fig_para.notes)
+
+
+def _emit_figure_addons(anchor: Paragraph, doc, fig: model.Figure):
+    _emit_figure_key_items(anchor, doc, fig.key_items)
+    _emit_figure_body_paragraphs(anchor, doc, fig.body_paragraphs)
+    footnote_num_id = (
+        _new_numbering_instance_from_style(doc, S.S_FIG_TABLE_NOTE)
+        if fig.footnotes else None
+    )
+    for footnote in fig.footnotes:
+        _emit_figure_table_footnote(anchor, doc, footnote, num_id=footnote_num_id)
+    if fig.source is not None:
+        _emit_figure_table_source(anchor, doc, fig.source)
 
 
 def _emit_formula_number(para: Paragraph, formula: model.Formula, appendix_letter=None):
@@ -421,6 +659,69 @@ def _set_cell_vertical_center(cell):
     tcpr.append(valign)
 
 
+def _set_cell_margins(cell, top=60, bottom=60, left=100, right=100):
+    tcpr = cell._tc.get_or_add_tcPr()
+    old = tcpr.find(qn("w:tcMar"))
+    if old is not None:
+        tcpr.remove(old)
+    tcmar = OxmlElement("w:tcMar")
+    for edge, value in (("top", top), ("left", left), ("bottom", bottom), ("right", right)):
+        node = OxmlElement("w:" + edge)
+        node.set(qn("w:w"), str(value))
+        node.set(qn("w:type"), "dxa")
+        tcmar.append(node)
+    tcpr.append(tcmar)
+
+
+_BORDER_SIZE_BY_NAME = {
+    "thin": 4,
+    "thick": 8,
+}
+
+
+def _append_border(parent, edge: str, value: str):
+    value = (value or "").strip().lower()
+    node = OxmlElement("w:" + edge)
+    if value == "none":
+        node.set(qn("w:val"), "nil")
+        node.set(qn("w:sz"), "0")
+    else:
+        node.set(qn("w:val"), "single")
+        node.set(qn("w:sz"), str(_BORDER_SIZE_BY_NAME.get(value, 4)))
+    node.set(qn("w:space"), "0")
+    node.set(qn("w:color"), "000000")
+    parent.append(node)
+
+
+def _set_table_borders(table, outer: str = "thick", inner: str = "thin"):
+    tblpr = table._tbl.find(qn("w:tblPr"))
+    if tblpr is None:
+        tblpr = OxmlElement("w:tblPr")
+        table._tbl.insert(0, tblpr)
+    old = tblpr.find(qn("w:tblBorders"))
+    if old is not None:
+        tblpr.remove(old)
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        _append_border(borders, edge, inner if edge.startswith("inside") else outer)
+    tblpr.append(borders)
+
+
+def _set_cell_borders(cell, borders: dict):
+    if not borders:
+        return
+    tcpr = cell._tc.get_or_add_tcPr()
+    old = tcpr.find(qn("w:tcBorders"))
+    if old is not None:
+        tcpr.remove(old)
+    node = OxmlElement("w:tcBorders")
+    for edge in ("top", "left", "bottom", "right"):
+        value = borders.get(edge)
+        if value:
+            _append_border(node, edge, value)
+    tcpr.append(node)
+
+
 def _set_row_repeat_header(row):
     trpr = row._tr.get_or_add_trPr()
     if trpr.find(qn("w:tblHeader")) is None:
@@ -431,18 +732,31 @@ def _set_row_repeat_header(row):
 
 def _cell_is_long_text(text: str, colspan: int = 1) -> bool:
     text = (text or "").strip()
-    return colspan > 1 or len(text) > 25 or "。" in text or "；" in text or "：" in text
+    return colspan > 1 or len(text) > 18 or any(mark in text for mark in "，。；：、（）()")
 
 
 def _parts_from_text(text: str) -> List[model.TableCellPart]:
     return [model.TableCellPart("text", text or "")]
 
 
-def _emit_table_cell_parts(paragraph: Paragraph, parts: List[model.TableCellPart]):
+def _emit_table_cell_parts(paragraph: Paragraph, doc, parts: List[model.TableCellPart],
+                           footnote_ref_state=None):
     from .. import mathconv
     if not parts:
         return
     for part in parts:
+        if part.kind == "note":
+            continue
+        if part.kind == "footnote_ref":
+            label = part.text
+            if footnote_ref_state is not None:
+                label = _footnote_ref_label(footnote_ref_state["next"])
+                footnote_ref_state["next"] += 1
+            if label:
+                run = paragraph.add_run(label)
+                _apply_character_style(doc, run, S.S_FIG_TABLE_NOTE_CONTENT)
+                run.font.superscript = True
+            continue
         if part.kind == "ref":
             _add_typed_ref(paragraph, model.RefSpan(
                 text=part.text,
@@ -462,7 +776,168 @@ def _emit_table_cell_parts(paragraph: Paragraph, parts: List[model.TableCellPart
             if i > 0:
                 paragraph.add_run().add_break()
             if piece:
-                paragraph.add_run(piece)
+                run = paragraph.add_run(piece)
+                if getattr(part, "subscript", False):
+                    run.font.subscript = True
+                if getattr(part, "superscript", False):
+                    run.font.superscript = True
+
+
+def _set_paragraph_style(doc, para: Paragraph, style_name: str):
+    try:
+        para.style = doc.styles[style_name]
+    except KeyError:
+        pass
+
+
+def _set_paragraph_left_indent(para: Paragraph, left_twips: int):
+    ppr = para._p.get_or_add_pPr()
+    ind = ppr.find(qn("w:ind"))
+    if ind is None:
+        ind = OxmlElement("w:ind")
+        ppr.append(ind)
+    ind.set(qn("w:left"), str(left_twips))
+    if ind.get(qn("w:firstLine")) is not None:
+        del ind.attrib[qn("w:firstLine")]
+    if ind.get(qn("w:firstLineChars")) is not None:
+        del ind.attrib[qn("w:firstLineChars")]
+
+
+def _set_paragraph_first_line_indent(para: Paragraph, first_line_twips: int, first_line_chars: int):
+    ppr = para._p.get_or_add_pPr()
+    ind = ppr.find(qn("w:ind"))
+    if ind is None:
+        ind = OxmlElement("w:ind")
+        ppr.append(ind)
+    for attr in ("left", "leftChars", "hanging", "hangingChars"):
+        key = qn("w:" + attr)
+        if ind.get(key) is not None:
+            del ind.attrib[key]
+    ind.set(qn("w:firstLine"), str(first_line_twips))
+    ind.set(qn("w:firstLineChars"), str(first_line_chars))
+
+
+def _reset_cell_to_single_paragraph(cell, doc, style_name: str) -> Paragraph:
+    cell.text = ""
+    para = cell.paragraphs[0]
+    _set_paragraph_style(doc, para, style_name)
+    return para
+
+
+def _format_table_footer_paragraph(para: Paragraph, doc, indent: bool = True):
+    _set_paragraph_style(doc, para, S.S_TABLE_CELL)
+    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    if indent:
+        _set_paragraph_left_indent(para, 420)
+
+
+def _split_table_cell_note_parts(parts: List[model.TableCellPart]):
+    body_parts: List[model.TableCellPart] = []
+    notes: List[List[model.Span]] = []
+    for part in parts:
+        if part.kind == "note":
+            notes.append(part.spans)
+        else:
+            body_parts.append(part)
+    return body_parts, notes
+
+
+def _table_cell_parts_have_body(parts: List[model.TableCellPart]) -> bool:
+    for part in parts:
+        if part.kind == "text":
+            if part.text.strip():
+                return True
+            continue
+        if part.kind != "note":
+            return True
+    return False
+
+
+def _format_table_cell_paragraph_with_notes(para: Paragraph, doc):
+    _set_paragraph_style(doc, para, S.S_PARA)
+    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    _set_paragraph_first_line_indent(para, 199, 95)
+
+
+def _emit_table_cell_notes(cell, doc, note_spans: List[List[model.Span]],
+                           first_para: Optional[Paragraph] = None):
+    if not note_spans:
+        return
+    numbered = len(note_spans) > 1
+    num_id = _new_numbering_instance_from_style(doc, S.S_NOTE_X) if numbered else None
+    for idx, spans in enumerate(note_spans):
+        para = first_para if idx == 0 and first_para is not None else cell.add_paragraph()
+        if numbered:
+            _set_paragraph_style(doc, para, S.S_NOTE_X)
+            _set_numbering_from_style(para, doc, S.S_NOTE_X, num_id_override=num_id)
+        else:
+            _set_paragraph_style(doc, para, S.S_NOTE)
+        _set_runs(para, spans)
+
+
+def _emit_table_cell_content(word_cell, doc, cell_model: model.TableCell,
+                             footnote_ref_state=None):
+    _set_cell_vertical_center(word_cell)
+    _set_cell_margins(word_cell)
+    _set_cell_borders(word_cell, cell_model.borders)
+    cp = word_cell.paragraphs[0]
+    parts = cell_model.parts or _parts_from_text(cell_model.text)
+    body_parts, note_spans = _split_table_cell_note_parts(parts)
+    if note_spans:
+        if _table_cell_parts_have_body(body_parts):
+            _format_table_cell_paragraph_with_notes(cp, doc)
+            _emit_table_cell_parts(cp, doc, body_parts, footnote_ref_state)
+            _emit_table_cell_notes(word_cell, doc, note_spans)
+        else:
+            _emit_table_cell_notes(word_cell, doc, note_spans, first_para=cp)
+        return
+    _set_paragraph_style(doc, cp, S.S_TABLE_CELL)
+    cp.alignment = (
+        WD_ALIGN_PARAGRAPH.LEFT
+        if not cell_model.header and _cell_is_long_text(cell_model.text, cell_model.colspan)
+        else WD_ALIGN_PARAGRAPH.CENTER
+    )
+    _emit_table_cell_parts(cp, doc, parts, footnote_ref_state)
+
+
+def _emit_table_footer_footnotes(table, doc, footnotes: List[model.FigureTableFootnote]):
+    if not footnotes:
+        return
+    num_id = _new_numbering_instance_from_style(doc, S.S_FIG_TABLE_NOTE)
+    row = table.add_row()
+    cell = row.cells[0]
+    if len(row.cells) > 1:
+        cell = cell.merge(row.cells[-1])
+    _set_cell_vertical_center(cell)
+    _set_cell_margins(cell)
+    para = _reset_cell_to_single_paragraph(cell, doc, S.S_FIG_TABLE_NOTE)
+    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    _emit_footnote_runs(para, doc, footnotes[0], num_id=num_id)
+    for footnote in footnotes[1:]:
+        para = cell.add_paragraph()
+        _set_paragraph_style(doc, para, S.S_FIG_TABLE_NOTE)
+        para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        _emit_footnote_runs(para, doc, footnote, num_id=num_id)
+
+
+def _emit_table_footer_source(table, doc, source: model.FigureTableSource):
+    row = table.add_row()
+    cell = row.cells[0]
+    if len(row.cells) > 1:
+        cell = cell.merge(row.cells[-1])
+    _set_cell_vertical_center(cell)
+    _set_cell_margins(cell)
+    para = _reset_cell_to_single_paragraph(cell, doc, S.S_FIG_TABLE_SOURCE)
+    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    para.paragraph_format.first_line_indent = 0
+    para.add_run("来源：")
+    _set_runs(para, source.spans)
+
+
+def _emit_table_footer_addons(table, doc, tbl: model.TableModel):
+    _emit_table_footer_footnotes(table, doc, tbl.footnotes)
+    if tbl.source is not None:
+        _emit_table_footer_source(table, doc, tbl.source)
 
 
 def _emit_table_continuation_caption(anchor: Paragraph, doc, tbl: model.TableModel,
@@ -476,6 +951,7 @@ def _emit_table_continuation_caption(anchor: Paragraph, doc, tbl: model.TableMod
             cap,
             _native_ref_name("tbl", tbl.anchor_id, "label"),
             display_text="表?",
+            switches="\\r",
         )
     else:
         cap.add_run("表")
@@ -486,79 +962,91 @@ def _emit_table_continuation_caption(anchor: Paragraph, doc, tbl: model.TableMod
     cap.add_run("（续）")
 
 
-def _emit_table_part(anchor: Paragraph, doc, tbl: model.TableModel, rows, row_parts, row_colspans,
-                     appendix_letter=None):
-    """输出一个表格片段。续表复用原表头，不新增 SEQ。"""
-
-    def row_width(row, spans):
-        if spans:
-            return sum(spans[:len(row)])
-        return len(row)
-
-    widths = []
+def _legacy_cell_rows(tbl: model.TableModel, rows, row_parts, row_colspans):
+    cell_rows: List[List[model.TableCell]] = []
     if tbl.header:
-        widths.append(row_width(tbl.header, tbl.header_colspans))
-    widths.extend(row_width(row, row_colspans[i] if i < len(row_colspans) else [])
-                  for i, row in enumerate(rows))
-    ncols = max(widths) if widths else 1
-    table = doc.add_table(rows=0, cols=ncols)
+        header_parts = tbl.header_parts or [_parts_from_text(text) for text in tbl.header]
+        header_spans = tbl.header_colspans or [1 for _ in tbl.header]
+        cell_rows.append([
+            model.TableCell(
+                text=text,
+                parts=header_parts[i] if i < len(header_parts) else _parts_from_text(text),
+                colspan=header_spans[i] if i < len(header_spans) else 1,
+                header=True,
+            )
+            for i, text in enumerate(tbl.header)
+        ])
+    for r_i, row in enumerate(rows):
+        parts_row = row_parts[r_i] if r_i < len(row_parts) else []
+        spans = row_colspans[r_i] if r_i < len(row_colspans) and row_colspans[r_i] else [1 for _ in row]
+        cell_rows.append([
+            model.TableCell(
+                text=text,
+                parts=parts_row[i] if i < len(parts_row) else _parts_from_text(text),
+                colspan=spans[i] if i < len(spans) else 1,
+            )
+            for i, text in enumerate(row)
+        ])
+    return cell_rows
+
+
+def _table_cell_layout(cell_rows: List[List[model.TableCell]]):
+    occupied = {}
+    placements = []
+    max_cols = 0
+    for r_i, row in enumerate(cell_rows):
+        row_placements = []
+        c_i = 0
+        for cell in row:
+            while occupied.get((r_i, c_i)):
+                c_i += 1
+            rowspan = max(1, int(cell.rowspan or 1))
+            colspan = max(1, int(cell.colspan or 1))
+            row_placements.append((cell, r_i, c_i, rowspan, colspan))
+            for rr in range(r_i, r_i + rowspan):
+                for cc in range(c_i, c_i + colspan):
+                    occupied[(rr, cc)] = True
+            max_cols = max(max_cols, c_i + colspan)
+            c_i += colspan
+        placements.append(row_placements)
+    return placements, max(1, max_cols)
+
+
+def _emit_table_part(anchor: Paragraph, doc, tbl: model.TableModel, rows, row_parts, row_colspans,
+                     appendix_letter=None, include_addons: bool = False):
+    """输出一个表格片段。续表复用原表头，不新增 SEQ。"""
+    cell_rows = tbl.cell_rows or _legacy_cell_rows(tbl, rows, row_parts, row_colspans)
+    placements, ncols = _table_cell_layout(cell_rows)
+    table = doc.add_table(rows=len(cell_rows), cols=ncols)
     try:
         table.style = doc.styles[S.S_TABLE_GRID]
     except KeyError:
         pass
+    _set_table_borders(table, tbl.border_outer or "thick", tbl.border_inner or "thin")
+    footnote_ref_state = {"next": 0}
 
-    all_rows = ([tbl.header] if tbl.header else []) + rows
-    header_parts = tbl.header_parts or [_parts_from_text(text) for text in tbl.header]
-    all_parts = ([header_parts] if tbl.header else []) + row_parts
-    all_spans = ([tbl.header_colspans or [1 for _ in tbl.header]] if tbl.header else [])
-    all_spans += [
-        row_colspans[i] if i < len(row_colspans) and row_colspans[i]
-        else [1 for _ in row]
-        for i, row in enumerate(rows)
-    ]
-
-    for r_i, row in enumerate(all_rows):
-        word_row = table.add_row()
-        if r_i == 0 and tbl.header:
+    for r_i, word_row in enumerate(table.rows):
+        if r_i < tbl.header_row_count:
             _set_row_repeat_header(word_row)
-        cells = word_row.cells
-        spans = all_spans[r_i] if r_i < len(all_spans) else [1 for _ in row]
-        parts_row = all_parts[r_i] if r_i < len(all_parts) else []
-        c_pos = 0
-        for c_i, txt in enumerate(row):
-            if c_pos >= ncols:
-                break
-            colspan = spans[c_i] if c_i < len(spans) else 1
-            colspan = max(1, min(colspan, ncols - c_pos))
-            cell = cells[c_pos]
-            if colspan > 1:
-                cell = cell.merge(cells[c_pos + colspan - 1])
-            _set_cell_vertical_center(cell)
-            cp = cell.paragraphs[0]
-            try:
-                cp.style = doc.styles[S.S_TABLE_CELL]
-            except KeyError:
-                pass
-            cp.alignment = (
-                WD_ALIGN_PARAGRAPH.LEFT
-                if _cell_is_long_text(txt, colspan)
-                else WD_ALIGN_PARAGRAPH.CENTER
-            )
-            parts = parts_row[c_i] if c_i < len(parts_row) else _parts_from_text(txt)
-            _emit_table_cell_parts(cp, parts)
-            c_pos += colspan
+    for row_placements in placements:
+        for cell_model, r_i, c_i, rowspan, colspan in row_placements:
+            word_cell = table.cell(r_i, c_i)
+            if rowspan > 1 or colspan > 1:
+                word_cell = word_cell.merge(table.cell(r_i + rowspan - 1, c_i + colspan - 1))
+            _reset_cell_to_single_paragraph(word_cell, doc, S.S_TABLE_CELL)
+            _emit_table_cell_content(word_cell, doc, cell_model, footnote_ref_state)
+    if include_addons:
+        _emit_table_footer_addons(table, doc, tbl)
     anchor._p.addprevious(table._tbl)
 
 
 def _emit_table(anchor: Paragraph, doc, tbl: model.TableModel, appendix_letter=None):
-    """表格：标题显式输出 `表N　标题`，模板样式只负责排版。"""
+    """表格：标题编号由模板表题样式自动生成。"""
     style = S.S_APPENDIX_TABLE_CAPTION if appendix_letter else S.S_TABLE_CAPTION
     cap = _new_paragraph_before(anchor, doc, style)
-    _set_numbering(cap, 0, 0)
-    _emit_visible_caption(
-        cap, "tbl", SEQ_TABLE, "表", tbl.anchor_id, tbl.caption or "",
-        appendix_letter=appendix_letter,
-    )
+    _emit_style_numbered_caption(cap, doc, style, "tbl", tbl.anchor_id, tbl.caption or "")
+    if tbl.unit is not None:
+        _emit_figure_table_unit(anchor, doc, tbl.unit)
 
     row_parts = tbl.row_parts or [
         [_parts_from_text(cell) for cell in row]
@@ -583,34 +1071,41 @@ def _emit_table(anchor: Paragraph, doc, tbl: model.TableModel, appendix_letter=N
                 row_parts[start:end],
                 row_colspans[start:end],
                 appendix_letter=appendix_letter,
+                include_addons=end == len(tbl.rows),
             )
             first = False
             start = end
-        _emit_figure_table_addons(anchor, doc, tbl)
         return
 
-    _emit_table_part(anchor, doc, tbl, tbl.rows, row_parts, row_colspans, appendix_letter=appendix_letter)
-    _emit_figure_table_addons(anchor, doc, tbl)
+    _emit_table_part(
+        anchor, doc, tbl, tbl.rows, row_parts, row_colspans,
+        appendix_letter=appendix_letter,
+        include_addons=True,
+    )
 
 
 def _emit_figure(anchor: Paragraph, doc, fig: model.Figure, appendix_letter=None):
-    img_p = _new_paragraph_before(anchor, doc, S.S_NORMAL)
-    if fig.path and os.path.isfile(fig.path):
-        try:
-            img_p.add_run().add_picture(fig.path)
-        except Exception:
-            img_p.add_run("[图片无法加载：%s]" % fig.path)
+    if fig.unit is not None:
+        _emit_figure_table_unit(anchor, doc, fig.unit)
+    if fig.subfigures:
+        _emit_subfigures(anchor, doc, fig.subfigures, columns=fig.subfigure_columns)
     else:
-        img_p.add_run("[缺少图片：%s]" % fig.path)
-    # 图题：标题显式输出 `图N　标题`，模板样式只负责排版。
+        img_p = _new_paragraph_before(anchor, doc, S.S_NORMAL)
+        _format_figure_image_paragraph(img_p)
+        if fig.path and os.path.isfile(fig.path):
+            try:
+                shape = img_p.add_run().add_picture(fig.path)
+                _fit_inline_shape_to_width(shape, _available_figure_width_emu(doc))
+            except Exception:
+                img_p.add_run("[图片无法加载：%s]" % fig.path)
+        else:
+            img_p.add_run("[缺少图片：%s]" % fig.path)
+    _emit_figure_addons(anchor, doc, fig)
+    # 图题编号由模板图题样式自动生成。
     style = S.S_APPENDIX_FIGURE_CAPTION if appendix_letter else S.S_FIGURE_CAPTION
     cap = _new_paragraph_before(anchor, doc, style)
-    _set_numbering(cap, 0, 0)
-    _emit_visible_caption(
-        cap, "fig", SEQ_FIGURE, "图", fig.anchor_id, fig.caption or "",
-        appendix_letter=appendix_letter,
-    )
-    _emit_figure_table_addons(anchor, doc, fig)
+    _keep_previous_block_with_paragraph(cap)
+    _emit_style_numbered_caption(cap, doc, style, "fig", fig.anchor_id, fig.caption or "")
 
 
 def _emit_body_blocks(anchor: Paragraph, doc, blocks: List[object], meta: Optional[model.Meta] = None):
@@ -618,11 +1113,23 @@ def _emit_body_blocks(anchor: Paragraph, doc, blocks: List[object], meta: Option
     in_terms = False
     in_normrefs = False
     ordered_list_num_id = None
-    for blk in blocks:
+    i = 0
+    while i < len(blocks):
+        blk = blocks[i]
         if isinstance(blk, model.Heading) and blk.level == 1:
             t = blk.text.strip()
             in_terms = "术语" in t and "定义" in t
             in_normrefs = "规范性引用文件" in t
+        if isinstance(blk, model.Note):
+            j = i
+            notes = []
+            while j < len(blocks) and isinstance(blocks[j], model.Note):
+                notes.append(blocks[j])
+                j += 1
+            _emit_note_group(anchor, doc, notes)
+            ordered_list_num_id = None
+            i = j
+            continue
         if isinstance(blk, model.ListBlock) and blk.ordered:
             style = S.ORDERED_LIST_STYLE_BY_LEVEL.get(blk.level, S.S_LIST_NUMBER_3)
             if blk.level == 1 or ordered_list_num_id is None:
@@ -634,6 +1141,7 @@ def _emit_body_blocks(anchor: Paragraph, doc, blocks: List[object], meta: Option
         else:
             _emit_body_block(anchor, doc, blk, in_terms=in_terms, in_normrefs=in_normrefs)
             ordered_list_num_id = None
+        i += 1
 
 
 def _chapter_blocks(body: List[object], start: int) -> List[object]:
@@ -714,12 +1222,26 @@ def _emit_appendices(anchor: Paragraph, doc, appendices: List[model.Appendix],
         _apply_style_run_properties(doc, nature_run, S.S_APPENDIX_NATURE)
         head.add_run().add_break()
         _add_styled_runs(head, doc, S.S_APPENDIX_TITLE, appx.title_spans)
+        _emit_hidden_appendix_caption_label(anchor, doc, S.S_APPENDIX_TABLE_LABEL)
+        _emit_hidden_appendix_caption_label(anchor, doc, S.S_APPENDIX_FIGURE_LABEL)
         ordered_list_num_id = None
-        for blk in appx.blocks:
+        i = 0
+        while i < len(appx.blocks):
+            blk = appx.blocks[i]
             if isinstance(blk, model.Heading):
                 style = S.APPENDIX_CLAUSE_STYLE_BY_LEVEL.get(blk.level, S.S_PARA)
                 _new_paragraph_before(anchor, doc, style, spans=blk.spans)
                 ordered_list_num_id = None
+            elif isinstance(blk, model.Note):
+                j = i
+                notes = []
+                while j < len(appx.blocks) and isinstance(appx.blocks[j], model.Note):
+                    notes.append(appx.blocks[j])
+                    j += 1
+                _emit_note_group(anchor, doc, notes)
+                ordered_list_num_id = None
+                i = j
+                continue
             elif isinstance(blk, model.ListBlock) and blk.ordered:
                 style = S.ORDERED_LIST_STYLE_BY_LEVEL.get(blk.level, S.S_LIST_NUMBER_3)
                 if blk.level == 1 or ordered_list_num_id is None:
@@ -732,6 +1254,7 @@ def _emit_appendices(anchor: Paragraph, doc, appendices: List[model.Appendix],
             else:
                 _emit_body_block(anchor, doc, blk, appendix_letter=letter)
                 ordered_list_num_id = None
+            i += 1
 
 
 def _emit_index_item(anchor: Paragraph, doc, item: model.IndexItem):

@@ -84,6 +84,47 @@ def _abstract_num_id_for_num(doc, num_id: int) -> Optional[int]:
     return None
 
 
+def _numbering_level_for_style(doc, style_name: str):
+    style_numbering = _style_numbering(doc, style_name)
+    if style_numbering is None:
+        return None
+    num_id, ilvl = style_numbering
+    abstract_num_id = _abstract_num_id_for_num(doc, num_id)
+    if abstract_num_id is None:
+        return None
+    numbering = doc.part.numbering_part.element
+    for abstract in numbering.findall(qn("w:abstractNum")):
+        if abstract.get(qn("w:abstractNumId")) != str(abstract_num_id):
+            continue
+        for lvl in abstract.findall(qn("w:lvl")):
+            if lvl.get(qn("w:ilvl")) == str(ilvl):
+                return lvl
+    return None
+
+
+def _normalize_caption_numbering_separator(doc, style_name: str):
+    """让表/图题样式只负责编号，题号与题名的间隔由可见文本负责。
+
+    模板中正文表/图题的 lvlText 带有尾随全角空格。Word 的 REF \r/\n
+    会把这个空格带进交叉引用，导致正文引用出现“表1　，”。生成文档时
+    将尾随空白移出编号定义，既保留样式自动编号，又得到干净的引用结果。
+    """
+    lvl = _numbering_level_for_style(doc, style_name)
+    if lvl is None:
+        return
+    lvl_text = lvl.find(qn("w:lvlText"))
+    if lvl_text is not None:
+        value = lvl_text.get(qn("w:val")) or ""
+        stripped = value.rstrip(" \t\r\n\u3000")
+        if stripped != value:
+            lvl_text.set(qn("w:val"), stripped)
+    suff = lvl.find(qn("w:suff"))
+    if suff is None:
+        suff = OxmlElement("w:suff")
+        lvl.append(suff)
+    suff.set(qn("w:val"), "nothing")
+
+
 def _next_numbering_id(doc) -> int:
     numbering = doc.part.numbering_part.element
     ids = []
@@ -154,10 +195,10 @@ def _configure_standard_styles(doc):
 
 
 # --------------------------------------------------------------------------- #
-# 域 / 书签（SEQ 自动编号、REF 交叉引用）
+# 域 / 书签（SEQ、样式编号、REF 交叉引用）
 # ---------------------------------------------------------------------------
-# SEQ 前缀与可见题注标签保持一致，避免 Word 只把数字识别为题注范围。
-# 表/图/公式都使用可见 SEQ；模板标题样式只负责外观，不再负责编号。
+# 公式使用可见 SEQ。表/图题使用模板标题样式自带编号，交叉引用通过
+# REF 的 \r/\n 开关读取带书签段落的自动编号。
 # 书签：
 #   _Ref... → Word 原生隐藏书签，分别围住编号、标签+编号、整项题注等范围。
 # --------------------------------------------------------------------------- #
@@ -200,14 +241,15 @@ def _bookmark_end(para: Paragraph, bid: int):
 
 
 def _add_ref_bookmark(para: Paragraph, bookmark_name: str, display_text: str = "?",
-                      charformat: bool = False):
+                      charformat: bool = False, switches: str = ""):
     """插入 REF 域，引用指定书签。display_text 是域更新前的占位结果。"""
     r = para.add_run()
     fb = OxmlElement("w:fldChar"); fb.set(qn("w:fldCharType"), "begin"); r._r.append(fb)
     r = para.add_run()
     it = OxmlElement("w:instrText"); it.set(qn("xml:space"), "preserve")
     fmt = " \\* CHARFORMAT" if charformat else ""
-    it.text = " REF %s \\h%s " % (bookmark_name, fmt)
+    switch_text = (" " + switches.strip()) if switches else ""
+    it.text = " REF %s \\h%s%s " % (bookmark_name, switch_text, fmt)
     r._r.append(it)
     r = para.add_run()
     fs = OxmlElement("w:fldChar"); fs.set(qn("w:fldCharType"), "separate"); r._r.append(fs)
@@ -273,6 +315,9 @@ def _add_typed_ref(para: Paragraph, ref: model.RefSpan):
     if ref.ref_type == "std":
         _add_ref(para, ref.target)
         return
+    if ref.ref_type in ("tbl", "fig"):
+        _add_numbered_caption_ref(para, ref)
+        return
     if ref.ref_type == "eq" and ref.mode in ("label", "full"):
         _add_hyperlinked_ref_bookmark(
             para,
@@ -285,6 +330,36 @@ def _add_typed_ref(para: Paragraph, ref: model.RefSpan):
         )
         return
     _add_ref_bookmark(para, _native_ref_name(ref.ref_type, ref.target, ref.mode))
+
+
+def _add_numbered_caption_ref(para: Paragraph, ref: model.RefSpan):
+    label_bookmark = _native_ref_name(ref.ref_type, ref.target, "label")
+    text_bookmark = _native_ref_name(ref.ref_type, ref.target, "text")
+    label_placeholder = "表?" if ref.ref_type == "tbl" else "图?"
+    if ref.mode == "full":
+        _add_ref_bookmark(
+            para,
+            label_bookmark,
+            display_text=label_placeholder,
+            switches="\\r",
+        )
+        para.add_run("　")
+        _add_ref_bookmark(para, text_bookmark, display_text="?")
+        return
+    if ref.mode == "label":
+        _add_ref_bookmark(
+            para,
+            label_bookmark,
+            display_text=label_placeholder,
+            switches="\\r",
+        )
+        return
+    _add_ref_bookmark(
+        para,
+        _native_ref_name(ref.ref_type, ref.target, "num"),
+        display_text="?",
+        switches="\\n",
+    )
 
 
 def _make_run_hidden(run_elem):

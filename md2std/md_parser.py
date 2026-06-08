@@ -8,10 +8,12 @@
 
 from __future__ import annotations
 
+import os
 import re
+import urllib.parse
 import warnings
 from html.parser import HTMLParser
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import yaml
 from markdown_it import MarkdownIt
@@ -150,14 +152,14 @@ def _split_reference_spans(spans: List[model.Span]) -> List[model.Span]:
         for m in _INLINE_REF_TOKEN_RE.finditer(sp.text):
             if m.start() > pos:
                 chunk = sp.text[pos:m.start()]
-                if "{{" in chunk or "}}" in chunk or "{@" in chunk:
+                if "{{" in chunk or "{@" in chunk:
                     raise ValueError("无效交叉引用语法：%s。" % chunk)
                 out.append(model.Span(chunk, sp.bold, sp.italic, sp.subscript, sp.superscript))
             out.append(_parse_ref_token(m.group(0), sp.bold, sp.italic))
             pos = m.end()
         if pos < len(sp.text):
             tail = sp.text[pos:]
-            if "{{" in tail or "}}" in tail or "{@" in tail:
+            if "{{" in tail or "{@" in tail:
                 raise ValueError("无效交叉引用语法：%s。" % tail)
             out.append(model.Span(tail, sp.bold, sp.italic, sp.subscript, sp.superscript))
     return out
@@ -388,6 +390,22 @@ def _inline_to_spans(inline_token) -> List[model.Span]:
     return _split_reference_spans(merged)
 
 
+def _inline_markup_to_spans(text: str) -> List[model.Span]:
+    """Parse a small inline-markup fragment into spans."""
+    md = MarkdownIt("commonmark")
+    tokens = md.parse((text or "").strip())
+    for i, tok in enumerate(tokens):
+        if tok.type == "inline":
+            return _inline_to_spans(tok)
+        if (
+            tok.type == "paragraph_open"
+            and i + 1 < len(tokens)
+            and tokens[i + 1].type == "inline"
+        ):
+            return _inline_to_spans(tokens[i + 1])
+    return [model.Span((text or "").strip())]
+
+
 def _inline_image(inline_token):
     """若 inline 仅含一张图片，返回 (alt, src)，否则 None。"""
     kids = [c for c in (inline_token.children or []) if c.type not in ("softbreak",)]
@@ -405,10 +423,11 @@ def _inline_image(inline_token):
 # --------------------------------------------------------------------------- #
 # 原始块用元组表示：
 #   ('heading', level, spans)
-#   ('para',  spans)
+#   ('para',  spans, raw_markdown)
 #   ('image', alt, src)
 #   ('list',  ordered:bool, items:List[List[Span]], level:int)
-#   ('table', header, rows, header_colspans, row_colspans, header_parts, row_parts)
+#   ('table', header, rows, header_colspans, row_colspans, header_parts, row_parts,
+#             cell_rows, header_row_count, border_outer, border_inner)
 #   ('pagebreak',)
 def _tokens_to_blocks(tokens, level=1):
     blocks = []
@@ -428,7 +447,7 @@ def _tokens_to_blocks(tokens, level=1):
             if img is not None:
                 blocks.append(("image", img[0], img[1]))
             else:
-                blocks.append(("para", _inline_to_spans(inline)))
+                blocks.append(("para", _inline_to_spans(inline), inline.content))
             i += 3
         elif tt in ("bullet_list_open", "ordered_list_open"):
             ordered = tt == "ordered_list_open"
@@ -437,14 +456,14 @@ def _tokens_to_blocks(tokens, level=1):
             blocks.extend(nested_blocks)
             i = j
         elif tt == "table_open":
-            j, header, rows, header_colspans, row_colspans, header_parts, row_parts = _parse_table(tokens, i)
-            blocks.append(("table", header, rows, header_colspans, row_colspans, header_parts, row_parts))
+            parsed = _parse_table(tokens, i)
+            j = parsed[0]
+            blocks.append(("table",) + parsed[1:])
             i = j
         elif tt == "html_block":
             parsed = _parse_html_table_block(tok.content)
             if parsed is not None:
-                header, rows, header_colspans, row_colspans, header_parts, row_parts = parsed
-                blocks.append(("table", header, rows, header_colspans, row_colspans, header_parts, row_parts))
+                blocks.append(("table",) + parsed)
             elif _is_page_break_marker(tok.content):
                 blocks.append(("pagebreak",))
             i += 1
@@ -463,7 +482,7 @@ def _tokens_to_blocks(tokens, level=1):
                 elif tokens[i].type == "blockquote_close":
                     depth -= 1
                 elif tokens[i].type == "inline":
-                    blocks.append(("para", _inline_to_spans(tokens[i])))
+                    blocks.append(("para", _inline_to_spans(tokens[i]), tokens[i].content))
                 i += 1
         else:
             i += 1
@@ -520,10 +539,12 @@ def _parse_table(tokens, start):
     rows: List[List[str]] = []
     header_parts: List[List[model.TableCellPart]] = []
     row_parts: List[List[List[model.TableCellPart]]] = []
+    cell_rows: List[List[model.TableCell]] = []
     i = start + 1
     n = len(tokens)
     cur: List[str] = []
     cur_parts: List[List[model.TableCellPart]] = []
+    cur_cells: List[model.TableCell] = []
     in_head = False
     while i < n:
         tt = tokens[i].type
@@ -537,6 +558,7 @@ def _parse_table(tokens, start):
         elif tt == "tr_open":
             cur = []
             cur_parts = []
+            cur_cells = []
         elif tt == "tr_close":
             if in_head:
                 header = cur
@@ -544,12 +566,18 @@ def _parse_table(tokens, start):
             else:
                 rows.append(cur)
                 row_parts.append(cur_parts)
+            cell_rows.append(cur_cells)
         elif tt in ("th_open", "td_open"):
             inline = tokens[i + 1] if i + 1 < n and tokens[i + 1].type == "inline" else None
             parts = _parse_table_cell_parts(inline.content if inline is not None else "")
             txt = _table_parts_text(parts)
             cur.append(txt)
             cur_parts.append(parts)
+            cur_cells.append(model.TableCell(
+                text=txt,
+                parts=parts,
+                header=tt == "th_open",
+            ))
         i += 1
     return (
         i,
@@ -559,14 +587,99 @@ def _parse_table(tokens, start):
         [[1 for _ in row] for row in rows],
         header_parts,
         row_parts,
+        cell_rows,
+        1 if header else 0,
+        "",
+        "",
     )
 
 
 _TABLE_CELL_PART_RE = re.compile(r"(<eq>(.*?)</eq>|\$([^$]+)\$)", re.S | re.I)
+_TABLE_CELL_INLINE_TOKEN_RE = re.compile(r"(\{\{[^{}]+\}\}|\{@[^}]+\}|〔\s*脚注\s*〕|\{脚注[A-Za-z]*\})")
+_FOOTNOTE_REF_TOKEN_RE = re.compile(r"^〔\s*脚注\s*〕$")
+_OLD_FOOTNOTE_REF_TOKEN_RE = re.compile(r"^\{脚注[A-Za-z]*\}$")
+_INLINE_NOTE_START_RE = re.compile(r"〔\s*注\s*[:：]")
+_OLD_INLINE_NOTE_START_RE = re.compile(r"\{\s*注\s*[:：]")
+
+
+def _find_inline_note_end(text: str, start: int, context: str) -> int:
+    i = start
+    while i < len(text):
+        if text.startswith("{{", i):
+            end = text.find("}}", i + 2)
+            if end < 0:
+                raise ValueError("无效交叉引用语法：%s。" % text[i:])
+            i = end + 2
+            continue
+        if text.startswith("{@", i):
+            end = text.find("}", i + 2)
+            if end < 0:
+                raise ValueError("无效交叉引用语法：%s。" % text[i:])
+            i = end + 1
+            continue
+        if text[i] == "〕":
+            return i
+        i += 1
+    raise ValueError("%s注标记缺少右方括号。" % context)
+
+
+def _split_inline_note_markers(text: str, context: str, allow_standalone: bool = False):
+    pieces = []
+    pos = 0
+    note_seen = False
+    body_seen = False
+    text = text or ""
+    while pos < len(text):
+        new_m = _INLINE_NOTE_START_RE.search(text, pos)
+        old_m = _OLD_INLINE_NOTE_START_RE.search(text, pos)
+        if old_m and (new_m is None or old_m.start() < new_m.start()):
+            raise ValueError("%s内联普通注请写成 `〔注：...〕`，不要使用 `{注：...}`。" % context)
+        m = new_m
+        if not m:
+            tail = text[pos:]
+            if note_seen and tail.strip():
+                raise ValueError("%s注必须连续写在被注释内容之后。" % context)
+            if not note_seen and tail:
+                pieces.append(("text", tail))
+            break
+        before = text[pos:m.start()]
+        if note_seen:
+            if before.strip():
+                raise ValueError("%s注必须连续写在被注释内容之后。" % context)
+        else:
+            if before and (before.strip() or not allow_standalone):
+                pieces.append(("text", before))
+                if before.strip():
+                    body_seen = True
+            if not body_seen and not allow_standalone:
+                raise ValueError("%s注必须跟在被注释内容之后。" % context)
+        end = _find_inline_note_end(text, m.end(), context)
+        content = text[m.end():end].strip()
+        if not content:
+            raise ValueError("%s注内容不能为空。" % context)
+        pieces.append(("note", content))
+        note_seen = True
+        pos = end + 1
+    return pieces
 
 
 def _parse_table_cell_parts(text: str) -> List[model.TableCellPart]:
     parts: List[model.TableCellPart] = []
+    for kind, content in _split_inline_note_markers(
+        text or "",
+        "表格单元格",
+        allow_standalone=True,
+    ):
+        if kind == "note":
+            parts.append(model.TableCellPart("note", spans=_inline_markup_to_spans(content)))
+        else:
+            _append_cell_body_parts(parts, content)
+    if not parts:
+        parts.append(model.TableCellPart("text", ""))
+    return parts
+
+
+def _append_cell_body_parts(parts: List[model.TableCellPart], text: str):
     pos = 0
     for m in _TABLE_CELL_PART_RE.finditer(text or ""):
         if m.start() > pos:
@@ -577,22 +690,27 @@ def _parse_table_cell_parts(text: str) -> List[model.TableCellPart]:
         pos = m.end()
     if pos < len(text or ""):
         _append_text_part(parts, _normalize_html_cell_text((text or "")[pos:]))
-    if not parts:
-        parts.append(model.TableCellPart("text", ""))
-    return parts
 
 
 def _append_text_part(parts: List[model.TableCellPart], text: str):
     if not text:
         return
     pos = 0
-    for m in _INLINE_REF_TOKEN_RE.finditer(text):
+    for m in _TABLE_CELL_INLINE_TOKEN_RE.finditer(text):
         if m.start() > pos:
             chunk = text[pos:m.start()]
             if "{{" in chunk or "}}" in chunk or "{@" in chunk:
                 raise ValueError("无效交叉引用语法：%s。" % chunk)
             _append_plain_text_part(parts, chunk)
-        ref = _parse_ref_token(m.group(0))
+        token = m.group(0)
+        footnote_ref = _FOOTNOTE_REF_TOKEN_RE.match(token)
+        if footnote_ref:
+            parts.append(model.TableCellPart("footnote_ref", ""))
+            pos = m.end()
+            continue
+        if _OLD_FOOTNOTE_REF_TOKEN_RE.match(token):
+            raise ValueError("表格内脚注引用请写成 `〔脚注〕`，不要使用 `{脚注}`。")
+        ref = _parse_ref_token(token)
         parts.append(model.TableCellPart(
             "ref",
             ref.text,
@@ -611,7 +729,40 @@ def _append_text_part(parts: List[model.TableCellPart], text: str):
 def _append_plain_text_part(parts: List[model.TableCellPart], text: str):
     if not text:
         return
-    if parts and parts[-1].kind == "text":
+    pos = 0
+    i = 0
+    while i < len(text):
+        marker = text[i]
+        if marker not in ("^", "~"):
+            i += 1
+            continue
+        j = text.find(marker, i + 1)
+        if j <= i + 1:
+            i += 1
+            continue
+        if i > pos:
+            _append_text_cell_part(parts, text[pos:i])
+        marked = text[i + 1:j]
+        parts.append(model.TableCellPart(
+            "text",
+            marked,
+            subscript=marker == "~",
+            superscript=marker == "^",
+        ))
+        i = j + 1
+        pos = i
+    if pos < len(text):
+        _append_text_cell_part(parts, text[pos:])
+
+
+def _append_text_cell_part(parts: List[model.TableCellPart], text: str):
+    if not text:
+        return
+    if (
+        parts and parts[-1].kind == "text"
+        and not parts[-1].subscript
+        and not parts[-1].superscript
+    ):
         parts[-1].text += text
     else:
         parts.append(model.TableCellPart("text", text))
@@ -634,6 +785,8 @@ def _table_parts_text(parts: List[model.TableCellPart]) -> str:
     for part in parts:
         if part.kind == "formula":
             out.append(_formula_display_text(part.text))
+        elif part.kind == "footnote_ref":
+            out.append(part.text)
         elif part.kind == "ref":
             if part.ref_type == "std":
                 out.append(part.target)
@@ -645,81 +798,154 @@ def _table_parts_text(parts: List[model.TableCellPart]) -> str:
                 out.append("图?")
             else:
                 out.append("?")
+        elif part.kind == "note":
+            continue
         else:
             out.append(part.text)
     return "".join(out).strip()
 
 
+_BORDER_VALUES = {"none", "thin", "thick"}
+
+
+def _parse_positive_int_attr(value: str, attr_name: str) -> int:
+    raw = (value or "1").strip()
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise ValueError("%s 必须为正整数：%s。" % (attr_name, raw)) from exc
+    if parsed < 1:
+        raise ValueError("%s 必须为正整数：%s。" % (attr_name, raw))
+    return parsed
+
+
+def _parse_border_attr(value: str, attr_name: str) -> str:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return ""
+    if raw not in _BORDER_VALUES:
+        raise ValueError("%s 只支持 none、thin、thick：%s。" % (attr_name, raw))
+    return raw
+
+
+def _html_attrs(attrs):
+    return {str(k).lower(): (v if v is not None else "") for k, v in attrs}
+
+
 class _HtmlTableParser(HTMLParser):
-    """提取简单 HTML 表格，支持 th/td、colspan 和 br。"""
+    """提取 HTML 表格，支持 th/td、colspan、rowspan、边框属性和 br。"""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.rows = []
+        self.border_outer = ""
+        self.border_inner = ""
+        self._in_table = False
         self._row = None
         self._cell = None
-        self._cell_parts = None
         self._capture = False
         self._cell_is_header = False
         self._cell_colspan = 1
-        self._inside_eq = False
-        self._eq_buf = []
+        self._cell_rowspan = 1
+        self._cell_borders = {}
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
-        if tag == "tr":
+        attr_map = _html_attrs(attrs)
+        if tag == "table":
+            self._in_table = True
+            self.border_outer = _parse_border_attr(attr_map.get("data-border-outer", ""), "data-border-outer")
+            self.border_inner = _parse_border_attr(attr_map.get("data-border-inner", ""), "data-border-inner")
+        elif tag == "tr" and self._in_table:
             self._row = []
         elif tag in ("td", "th") and self._row is not None:
-            attr_map = {k.lower(): v for k, v in attrs}
-            try:
-                colspan = int(attr_map.get("colspan") or "1")
-            except ValueError:
-                colspan = 1
+            colspan = _parse_positive_int_attr(attr_map.get("colspan", "1"), "colspan")
+            rowspan = _parse_positive_int_attr(attr_map.get("rowspan", "1"), "rowspan")
             self._cell = []
-            self._cell_parts = []
             self._capture = True
             self._cell_is_header = tag == "th"
-            self._cell_colspan = max(1, colspan)
-        elif tag == "eq" and self._capture and self._cell_parts is not None:
-            self._inside_eq = True
-            self._eq_buf = []
+            self._cell_colspan = colspan
+            self._cell_rowspan = rowspan
+            self._cell_borders = {
+                edge: value
+                for edge, value in (
+                    ("top", _parse_border_attr(attr_map.get("data-border-top", ""), "data-border-top")),
+                    ("right", _parse_border_attr(attr_map.get("data-border-right", ""), "data-border-right")),
+                    ("bottom", _parse_border_attr(attr_map.get("data-border-bottom", ""), "data-border-bottom")),
+                    ("left", _parse_border_attr(attr_map.get("data-border-left", ""), "data-border-left")),
+                )
+                if value
+            }
+        elif tag == "eq" and self._capture and self._cell is not None:
+            self._cell.append("<eq>")
         elif tag == "br" and self._capture and self._cell is not None:
             self._cell.append("\n")
-            _append_text_part(self._cell_parts, "\n")
 
     def handle_endtag(self, tag):
         tag = tag.lower()
         if tag in ("td", "th") and self._row is not None and self._cell is not None:
-            text = _table_parts_text(self._cell_parts or [])
+            parts = _parse_table_cell_parts("".join(self._cell))
+            text = _table_parts_text(parts)
             self._row.append({
                 "text": text,
-                "parts": self._cell_parts or [model.TableCellPart("text", text)],
+                "parts": parts,
                 "colspan": self._cell_colspan,
+                "rowspan": self._cell_rowspan,
+                "borders": dict(self._cell_borders),
                 "header": self._cell_is_header,
             })
             self._cell = None
-            self._cell_parts = None
             self._capture = False
             self._cell_is_header = False
             self._cell_colspan = 1
-        elif tag == "eq" and self._capture and self._cell_parts is not None:
-            formula = "".join(self._eq_buf).strip()
-            if formula:
-                self._cell_parts.append(model.TableCellPart("formula", formula))
-            self._inside_eq = False
-            self._eq_buf = []
+            self._cell_rowspan = 1
+            self._cell_borders = {}
+        elif tag == "eq" and self._capture and self._cell is not None:
+            self._cell.append("</eq>")
         elif tag == "tr" and self._row is not None:
             if self._row:
                 self.rows.append(self._row)
             self._row = None
+        elif tag == "table":
+            self._in_table = False
 
     def handle_data(self, data):
         if self._capture and self._cell is not None:
             self._cell.append(data)
-            if self._inside_eq:
-                self._eq_buf.append(data)
-            else:
-                _append_text_part(self._cell_parts, _normalize_html_cell_text(data))
+
+
+def _html_table_cell_from_raw(cell) -> model.TableCell:
+    return model.TableCell(
+        text=cell["text"],
+        parts=cell["parts"],
+        colspan=cell["colspan"],
+        rowspan=cell["rowspan"],
+        borders=cell["borders"],
+        header=cell["header"],
+    )
+
+
+def _validate_html_table_grid(cell_rows: List[List[model.TableCell]]) -> int:
+    occupied = {}
+    max_col = 0
+    row_count = len(cell_rows)
+    for r_i, row in enumerate(cell_rows):
+        c_i = 0
+        for cell in row:
+            if r_i + cell.rowspan > row_count:
+                raise ValueError("rowspan 超出表格行数。")
+            while occupied.get((r_i, c_i)):
+                c_i += 1
+            for rr in range(r_i, r_i + cell.rowspan):
+                for cc in range(c_i, c_i + cell.colspan):
+                    if occupied.get((rr, cc)):
+                        raise ValueError("HTML 表格合并单元格发生重叠。")
+            for rr in range(r_i, r_i + cell.rowspan):
+                for cc in range(c_i, c_i + cell.colspan):
+                    occupied[(rr, cc)] = True
+            max_col = max(max_col, c_i + cell.colspan)
+            c_i += cell.colspan
+    return max_col
 
 
 def _normalize_html_cell_text(text: str) -> str:
@@ -734,41 +960,78 @@ def _parse_html_table_block(content: str):
         return None
     parser = _HtmlTableParser()
     parser.feed(content)
-    rows = parser.rows
-    if not rows:
+    raw_rows = parser.rows
+    if not raw_rows:
         return None
-    first = rows[0]
-    use_first_as_header = any(cell["header"] for cell in first) or len(rows) > 1
+    cell_rows = [
+        [_html_table_cell_from_raw(cell) for cell in row]
+        for row in raw_rows
+    ]
+    _validate_html_table_grid(cell_rows)
+    first = cell_rows[0]
+    use_first_as_header = any(cell.header for cell in first) or len(cell_rows) > 1
     if use_first_as_header:
-        header = [cell["text"] for cell in first]
-        header_parts = [cell["parts"] for cell in first]
-        header_colspans = [cell["colspan"] for cell in first]
-        data_rows = rows[1:]
+        header = [cell.text for cell in first]
+        header_parts = [cell.parts for cell in first]
+        header_colspans = [cell.colspan for cell in first]
+        data_rows = cell_rows[1:]
+        header_row_count = 1
     else:
         header = []
         header_parts = []
         header_colspans = []
-        data_rows = rows
-    body_rows = [[cell["text"] for cell in row] for row in data_rows]
-    row_parts = [[cell["parts"] for cell in row] for row in data_rows]
-    row_colspans = [[cell["colspan"] for cell in row] for row in data_rows]
-    return header, body_rows, header_colspans, row_colspans, header_parts, row_parts
+        data_rows = cell_rows
+        header_row_count = 0
+    body_rows = [[cell.text for cell in row] for row in data_rows]
+    row_parts = [[cell.parts for cell in row] for row in data_rows]
+    row_colspans = [[cell.colspan for cell in row] for row in data_rows]
+    return (
+        header,
+        body_rows,
+        header_colspans,
+        row_colspans,
+        header_parts,
+        row_parts,
+        cell_rows,
+        header_row_count,
+        parser.border_outer,
+        parser.border_inner,
+    )
 
 
 # --------------------------------------------------------------------------- #
 # 原始块 -> StandardDoc（路由）
 # --------------------------------------------------------------------------- #
 _NOTE_RE = re.compile(r"^\s*注\s*(\d+)?\s*[:：]")
+_BRACED_NOTE_RE = re.compile(r"^\s*\{\s*注\s*(?P<index>\d+)?\s*[:：]\s*(?P<content>.*?)\s*\}\s*$")
 _EXAMPLE_RE = re.compile(r"^\s*示例\s*(\d+)?\s*[:：]")
+_EXAMPLE_END_RE = re.compile(r"^\s*\{\s*示例结束\s*\}\s*$")
 _SOURCE_RE = re.compile(r"^\s*\[?\s*来源\s*[:：]")
 _TABLE_NOTE_RE = re.compile(r"^\s*\{\s*表注\s*(?P<index>\d+)?\s*[:：]\s*(?P<content>.*?)\s*\}\s*$")
 _FIGURE_NOTE_RE = re.compile(r"^\s*\{\s*图注\s*(?P<index>\d+)?\s*[:：]\s*(?P<content>.*?)\s*\}\s*$")
 _TABLE_SOURCE_RE = re.compile(r"^\s*\{\s*表来源\s*[:：]\s*(?P<content>.*?)\s*\}\s*$")
 _FIGURE_SOURCE_RE = re.compile(r"^\s*\{\s*图来源\s*[:：]\s*(?P<content>.*?)\s*\}\s*$")
+_TABLE_UNIT_RE = re.compile(r"^\s*\{\s*表单位\s*[:：]\s*(?P<content>.*?)\s*\}\s*$")
+_FIGURE_UNIT_RE = re.compile(r"^\s*\{\s*图单位\s*[:：]\s*(?P<content>.*?)\s*\}\s*$")
+_TABLE_FOOTNOTE_RE = re.compile(r"^\s*\{\s*表脚注\s*[:：]\s*(?P<content>.*?)\s*\}\s*$")
+_FIGURE_FOOTNOTE_RE = re.compile(r"^\s*\{\s*图脚注\s*[:：]\s*(?P<content>.*?)\s*\}\s*$")
+_LEGACY_TABLE_FOOTNOTE_RE = re.compile(r"^\s*\{\s*表脚注\s*[A-Za-z]+\s*[:：]\s*.*?\s*\}\s*$")
+_LEGACY_FIGURE_FOOTNOTE_RE = re.compile(r"^\s*\{\s*图脚注\s*[A-Za-z]+\s*[:：]\s*.*?\s*\}\s*$")
+_GENERIC_UNIT_RE = re.compile(r"^\s*\{\s*单位\s*\}\s*(?P<content>.*?)\s*$")
+_GENERIC_SOURCE_RE = re.compile(r"^\s*\{\s*来源\s*\}\s*(?P<content>.*?)\s*$")
+_GENERIC_FOOTNOTE_RE = re.compile(r"^\s*\{\s*脚注\s*\}\s*(?P<content>.*?)\s*$")
+_FIGURE_KEY_ITEM_RE = re.compile(r"^\s*\{\s*图标引\s*\}\s*(?P<content>.*?)\s*$")
+_LEGACY_FIGURE_KEY_ITEM_RE = re.compile(r"^\s*\{\s*图标引\s*[0-9A-Za-z]*\s*[:：]\s*.*?\s*\}\s*$")
+_FIGURE_BODY_PARAGRAPH_RE = re.compile(r"^\s*\{\s*图段\s*\}\s*(?P<content>.*?)\s*$")
+_LEGACY_FIGURE_BODY_PARAGRAPH_RE = re.compile(r"^\s*\{\s*图段\s*[:：]\s*.*?\s*\}\s*$")
+_FIGURE_SUBFIGURE_RE = re.compile(r"^\s*\{\s*分图\s*[:：]\s*.*?\s*\}\s*$")
+_FIGURE_SUBFIGURE_GROUP_RE = re.compile(r"^\s*\{\s*分图组\s*[:：]\s*(?P<columns>\d+)\s*\}\s*$")
+_LEGACY_FIGURE_SUBFIGURE_GROUP_RE = re.compile(r"^\s*\{\s*分图组\s*[:：]\s*\d+\s*[|｜].*?\}\s*$")
 _TERM_MARKER_RE = re.compile(r"^\s*\{\s*术语\s*[:：]\s*(.+?)\s*\}\s*$")
 _TERM_SPLIT_RE = re.compile(r"^(.*?)(?:\s*[|｜]\s*|[\s　]{2,})(.+)$")
 _TABLE_CAP_RE = re.compile(r"^\s*\{\s*表\s*[:：]\s*#([^}\s]+)\s*\}\s+(.+?)\s*$")
 _TABLE_CAP_MARKER_RE = re.compile(r"^\s*(?:\{\s*)?表\s*[:：]")
+_FIGURE_CAP_RE = re.compile(r"^\s*\{\s*图\s*[:：]\s*#([^}\s]+)\s*\}\s+(.+?)\s*$")
 # 无标题条：显式声明编号层级，不手写具体编号。
 _UNTITLED_RE = re.compile(r"^\s*\{\s*无标题条\s*[:：]\s*([2-6])\s*\}\s*(\S.*)$", re.S)
 _LEGACY_UNTITLED_RE = re.compile(r"^\s*(\d+(?:\.\d+)+)\s+(\S.*)$", re.S)
@@ -781,9 +1044,56 @@ def _spans_text(spans):
     return "".join(s.text for s in spans)
 
 
+def _para_raw_text(blk) -> str:
+    return blk[2] if len(blk) > 2 and isinstance(blk[2], str) else _spans_text(blk[1])
+
+
+def _source_base_dir(source_path: str = "", base_dir: str = "") -> str:
+    if base_dir:
+        return os.path.abspath(base_dir)
+    if source_path:
+        return os.path.dirname(os.path.abspath(source_path))
+    return ""
+
+
+def _is_url_path(path: str) -> bool:
+    return bool(re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", path or ""))
+
+
+def _resolve_asset_path(path: str, base_dir: str = "") -> str:
+    path = urllib.parse.unquote((path or "").strip())
+    if not path or not base_dir or os.path.isabs(path) or _is_url_path(path):
+        return path
+    return os.path.normpath(os.path.join(base_dir, path))
+
+
 def _example_has_inline_content(example: model.Example) -> bool:
     text = _spans_text(example.spans)
     return _EXAMPLE_RE.sub("", text, count=1).strip() != ""
+
+
+def _block_plain_text(blk) -> str:
+    if blk[0] == "para":
+        return _para_raw_text(blk).strip()
+    if blk[0] == "heading":
+        return _spans_text(blk[2]).strip()
+    return ""
+
+
+def _has_pending_example_end(blocks, start: int) -> bool:
+    idx = start
+    while idx < len(blocks):
+        blk = blocks[idx]
+        if blk[0] == "heading":
+            return False
+        if blk[0] == "para":
+            text = _block_plain_text(blk)
+            if _EXAMPLE_END_RE.match(text):
+                return True
+            if _EXAMPLE_RE.match(text):
+                return False
+        idx += 1
+    return False
 
 
 def _marker_content_start(text: str, marker_end: int) -> int:
@@ -839,48 +1149,173 @@ def _slice_spans(spans: List[model.Span], start: int, end: int) -> List[model.Sp
     return out
 
 
-def _parse_figure_table_addon(spans: List[model.Span]):
+def _parse_subfigure_group_item(fragment: str, base_dir: str = "") -> model.FigureSubfigure:
+    fragment = (fragment or "").strip()
+    if not fragment:
+        raise ValueError("分图组中存在空的分图项。")
+    md = MarkdownIt("commonmark")
+    tokens = md.parse(fragment)
+    if len(tokens) != 3 or tokens[0].type != "paragraph_open" or tokens[1].type != "inline":
+        raise ValueError("分图组分图项必须写成 `![分图题](图片路径)`：%s。" % fragment)
+    image = _inline_image(tokens[1])
+    if image is None:
+        raise ValueError("分图组分图项必须写成 `![分图题](图片路径)`：%s。" % fragment)
+    caption, path = image
+    path = (path or "").strip()
+    if not path:
+        raise ValueError("分图组图片路径不能为空。")
+    return model.FigureSubfigure(
+        path=_resolve_asset_path(path, base_dir),
+        caption=(caption or "").strip(),
+    )
+
+
+def _parse_subfigure_group(text: str, base_dir: str = ""):
+    m = _FIGURE_SUBFIGURE_GROUP_RE.match(text)
+    if not m:
+        return None
+    columns = int(m.group("columns"))
+    if columns < 1 or columns > 6:
+        raise ValueError("分图组并排数量应为 1 到 6。")
+    return columns
+
+
+def _require_addon_content(text: str, marker: str) -> None:
+    if not (text or "").strip():
+        raise ValueError("%s内容不能为空。" % marker)
+
+
+def _parse_figure_table_addon(spans: List[model.Span], base_dir: str = "",
+                              raw_text: Optional[str] = None):
+    raw = (raw_text if raw_text is not None else _spans_text(spans)).strip()
+    if _FIGURE_SUBFIGURE_RE.match(raw):
+        raise ValueError("分图语法已改为分图组，请写成 `{分图组:2}` 后连续放置 Markdown 图片。")
+    if _LEGACY_FIGURE_SUBFIGURE_GROUP_RE.match(raw):
+        raise ValueError("分图组内容不要写进 `{}`，请写成 `{分图组:2}` 后连续放置 Markdown 图片。")
+    subfigure_group = _parse_subfigure_group(raw, base_dir=base_dir)
+    if subfigure_group is not None:
+        return "fig", "subfigure_group", subfigure_group
+
     text = _spans_text(spans)
-    for ref_type, regex in (("tbl", _TABLE_NOTE_RE), ("fig", _FIGURE_NOTE_RE)):
+    for label, regex, message in (
+        ("表", _TABLE_NOTE_RE, "表注语法已移除，请把普通注写在被注释内容所在单元格内：段内容〔注：...〕。"),
+        ("图", _FIGURE_NOTE_RE, "图注语法已移除，请使用正文普通注，图内段可写成 `{图段} 段内容〔注：...〕`。"),
+    ):
+        m = regex.match(text)
+        if m:
+            raise ValueError(message)
+    legacy_message = (
+        "图表附加项内容不要写进 `{}`，请使用 `{单位} ...`、`{来源} ...`、`{脚注} ...` 等写法。"
+    )
+    for regex in (
+        _TABLE_SOURCE_RE, _FIGURE_SOURCE_RE, _TABLE_UNIT_RE, _FIGURE_UNIT_RE,
+        _TABLE_FOOTNOTE_RE, _FIGURE_FOOTNOTE_RE, _LEGACY_TABLE_FOOTNOTE_RE,
+        _LEGACY_FIGURE_FOOTNOTE_RE,
+    ):
+        if regex.match(text):
+            raise ValueError(legacy_message)
+    for kind, regex, cls, marker in (
+        ("source", _GENERIC_SOURCE_RE, model.FigureTableSource, "来源"),
+        ("unit", _GENERIC_UNIT_RE, model.FigureTableSource, "单位"),
+        ("footnote", _GENERIC_FOOTNOTE_RE, model.FigureTableFootnote, "脚注"),
+    ):
         m = regex.match(text)
         if not m:
             continue
+        _require_addon_content(m.group("content"), marker)
         content_spans = _slice_spans(spans, m.start("content"), m.end("content"))
-        return (
-            ref_type,
-            "note",
-            model.Note(
-                spans=content_spans,
-                index=int(m.group("index")) if m.group("index") else None,
-            ),
-        )
-    for ref_type, regex in (("tbl", _TABLE_SOURCE_RE), ("fig", _FIGURE_SOURCE_RE)):
-        m = regex.match(text)
-        if not m:
-            continue
-        content_spans = _slice_spans(spans, m.start("content"), m.end("content"))
-        return ref_type, "source", model.FigureTableSource(spans=content_spans)
+        return "any", kind, cls(spans=content_spans)
+    if _LEGACY_FIGURE_KEY_ITEM_RE.match(text):
+        raise ValueError("图标引不再手写编号，请写成 `{图标引} 说明的内容`。")
+    m_key_item = _FIGURE_KEY_ITEM_RE.match(text)
+    if m_key_item:
+        _require_addon_content(m_key_item.group("content"), "图标引")
+        content_spans = _slice_spans(spans, m_key_item.start("content"), m_key_item.end("content"))
+        return "fig", "key_item", model.FigureKeyItem(index="", spans=content_spans)
+    if _LEGACY_FIGURE_BODY_PARAGRAPH_RE.match(text):
+        raise ValueError("图段内容不要写进 `{}`，请写成 `{图段} 段内容`。")
+    m_para = _FIGURE_BODY_PARAGRAPH_RE.match(text)
+    if m_para:
+        _require_addon_content(m_para.group("content"), "图段")
+        return "fig", "body_paragraph", _parse_figure_body_paragraph(m_para.group("content"))
     return None
+
+
+def _parse_figure_body_paragraph(content: str) -> model.FigureBodyParagraph:
+    body = ""
+    notes: List[model.Note] = []
+    for kind, value in _split_inline_note_markers(content or "", "图段"):
+        if kind == "note":
+            notes.append(model.Note(spans=_inline_markup_to_spans(value)))
+        else:
+            body += value
+    return model.FigureBodyParagraph(spans=_inline_markup_to_spans(body), notes=notes)
 
 
 def _attach_figure_table_addon(target, addon):
     ref_type, kind, value = addon
     label = "表" if ref_type == "tbl" else "图"
-    suffix = "注" if kind == "note" else "来源"
-    expected_type = model.TableModel if ref_type == "tbl" else model.Figure
-    if not isinstance(target, expected_type):
-        raise ValueError("%s%s必须紧跟%s。" % (label, suffix, "表格" if ref_type == "tbl" else "图片"))
-    if kind == "note":
-        target.notes.append(value)
+    suffix = {
+        "source": "来源",
+        "unit": "单位",
+        "footnote": "脚注",
+        "key_item": "标引序号说明",
+        "body_paragraph": "段",
+        "subfigure_group": "分图组",
+    }[kind]
+    if ref_type == "any":
+        if not isinstance(target, (model.TableModel, model.Figure)):
+            raise ValueError("%s必须紧跟表格或图片。" % suffix)
+    else:
+        expected_type = model.TableModel if ref_type == "tbl" else model.Figure
+        if not isinstance(target, expected_type):
+            raise ValueError("%s%s必须紧跟%s。" % (label, suffix, "表格" if ref_type == "tbl" else "图片"))
+    if kind == "footnote":
+        target.footnotes.append(value)
         return
-    if target.source is not None:
-        raise ValueError("%s来源只能写一次。" % label)
-    target.source = value
+    if kind == "key_item":
+        value.index = str(len(target.key_items) + 1)
+        target.key_items.append(value)
+        return
+    if kind == "body_paragraph":
+        target.body_paragraphs.append(value)
+        return
+    if kind == "subfigure_group":
+        columns = value
+        if target.subfigures:
+            raise ValueError("分图组只能写一次。")
+        target.subfigure_columns = columns
+        return
+    if kind == "source":
+        if target.source is not None:
+            raise ValueError("来源只能写一次。")
+        target.source = value
+        return
+    if target.unit is not None:
+        raise ValueError("单位只能写一次。")
+    target.unit = value
 
 
-def parse(text: str) -> model.StandardDoc:
+def _consume_subfigure_group_images(blocks, start: int, figure: model.Figure, base_dir: str = "") -> int:
+    idx = start
+    consumed = 0
+    while idx < len(blocks) and blocks[idx][0] == "image":
+        caption, _ = _pop_anchor(blocks[idx][1])
+        figure.subfigures.append(model.FigureSubfigure(
+            path=_resolve_asset_path(blocks[idx][2], base_dir),
+            caption=caption,
+        ))
+        consumed += 1
+        idx += 1
+    if consumed == 0:
+        raise ValueError("分图组后至少应紧跟一张 Markdown 图片。")
+    return idx
+
+
+def parse(text: str, source_path: str = "", base_dir: str = "") -> model.StandardDoc:
     data, body_md = split_front_matter(text)
     doc = model.StandardDoc(meta=build_meta(data))
+    asset_base_dir = _source_base_dir(source_path=source_path, base_dir=base_dir)
 
     body_md, formulas = extract_formulas(body_md)
     md = MarkdownIt("commonmark").enable("table")
@@ -892,6 +1327,7 @@ def parse(text: str) -> model.StandardDoc:
     cur_index_group = None
     table_caption = None      # None 或 (caption_text, verbatim_bool)
     expect_example_content = False
+    in_example_block = False
     last_addon_target = None
 
     idx = 0
@@ -901,6 +1337,8 @@ def parse(text: str) -> model.StandardDoc:
 
         # --- 标题：可能切换 mode ---
         if kind == "heading":
+            if in_example_block:
+                raise ValueError("示例块缺少 `{示例结束}`。")
             last_addon_target = None
             lvl, spans = blk[1], blk[2]
             htext = _spans_text(spans).strip()
@@ -921,23 +1359,27 @@ def parse(text: str) -> model.StandardDoc:
                     mode = "references"
                     cur_index_group = None
                     expect_example_content = False
+                    in_example_block = False
                     idx += 1
                     continue
                 if htext == "索引":
                     mode = "index"
                     cur_index_group = None
                     expect_example_content = False
+                    in_example_block = False
                     idx += 1
                     continue
                 mode = "body"
                 cur_index_group = None
                 expect_example_content = False
+                in_example_block = False
                 doc.body.append(model.Heading(level=1, spans=spans))
                 idx += 1
                 continue
             else:  # lvl >= 2
                 heading = model.Heading(level=lvl, spans=spans)
                 expect_example_content = False
+                in_example_block = False
                 if mode == "appendix" and cur_appendix is not None:
                     cur_appendix.blocks.append(heading)
                 elif mode == "body":
@@ -950,6 +1392,16 @@ def parse(text: str) -> model.StandardDoc:
                 # references 下的子标题忽略
                 idx += 1
                 continue
+
+        # --- 显式示例块结束 ---
+        if kind == "para" and _EXAMPLE_END_RE.match(_block_plain_text(blk)):
+            if not in_example_block:
+                raise ValueError("`{示例结束}` 没有对应的 `示例：`。")
+            in_example_block = False
+            expect_example_content = False
+            last_addon_target = None
+            idx += 1
+            continue
 
         # --- 块级公式占位段 ---
         if kind == "para":
@@ -969,9 +1421,40 @@ def parse(text: str) -> model.StandardDoc:
 
         # --- 表/图附加项：只绑定紧邻的上一张表或图 ---
         if kind == "para":
-            addon = _parse_figure_table_addon(blk[1])
+            addon = _parse_figure_table_addon(
+                blk[1],
+                base_dir=asset_base_dir,
+                raw_text=_para_raw_text(blk),
+            )
             if addon is not None:
                 _attach_figure_table_addon(last_addon_target, addon)
+                expect_example_content = False
+                idx += 1
+                if addon[1] == "subfigure_group":
+                    idx = _consume_subfigure_group_images(
+                        blocks,
+                        idx,
+                        last_addon_target,
+                        base_dir=asset_base_dir,
+                    )
+                continue
+
+        # --- 组合图题（"{图：#fig:id} 标题"，后接一个或多个分图附加项）---
+        if kind == "para":
+            ptext = _spans_text(blk[1]).strip()
+            m_fig_cap = _FIGURE_CAP_RE.match(ptext)
+            if m_fig_cap:
+                anchor = _parse_typed_anchor(m_fig_cap.group(1).strip(), "fig", "图题")
+                title = m_fig_cap.group(2).strip()
+                _assert_clean_caption("fig", title, "图题")
+                target_block = model.Figure(caption=title, path="", anchor_id=anchor)
+                if mode == "body":
+                    doc.body.append(target_block)
+                elif mode == "appendix" and cur_appendix is not None:
+                    cur_appendix.blocks.append(target_block)
+                else:
+                    raise ValueError("图题只能写在正文或附录中：%s。" % ptext)
+                last_addon_target = target_block
                 expect_example_content = False
                 idx += 1
                 continue
@@ -994,19 +1477,29 @@ def parse(text: str) -> model.StandardDoc:
                                      ptext)
 
         # --- 构造目标块 ---
-        target_block = _make_block(kind, blk, table_caption)
+        target_block = _make_block(kind, blk, table_caption, base_dir=asset_base_dir)
         table_caption = None
         if target_block is None:
             last_addon_target = None
             idx += 1
             continue
 
-        if expect_example_content and isinstance(target_block, model.Paragraph):
+        if in_example_block and isinstance(target_block, model.Example):
+            raise ValueError("示例块不能嵌套，请先写 `{示例结束}`。")
+        if in_example_block and isinstance(target_block, model.Paragraph):
             target_block = model.ExampleContent(spans=target_block.spans)
-        expect_example_content = (
-            isinstance(target_block, model.Example)
-            and not _example_has_inline_content(target_block)
-        )
+            expect_example_content = False
+        elif expect_example_content and isinstance(target_block, model.Paragraph):
+            target_block = model.ExampleContent(spans=target_block.spans)
+            expect_example_content = False
+        elif isinstance(target_block, model.Example) and not _example_has_inline_content(target_block):
+            if _has_pending_example_end(blocks, idx + 1):
+                in_example_block = True
+                expect_example_content = False
+            else:
+                expect_example_content = True
+        else:
+            expect_example_content = False
 
         can_accept_addons = (
             isinstance(target_block, (model.TableModel, model.Figure))
@@ -1024,6 +1517,8 @@ def parse(text: str) -> model.StandardDoc:
         last_addon_target = target_block if can_accept_addons else None
         idx += 1
 
+    if in_example_block:
+        raise ValueError("示例块缺少 `{示例结束}`。")
     _normalize_terms(doc)
     _validate_refs(doc)
     return doc
@@ -1109,7 +1604,7 @@ def _normalize_terms(doc: model.StandardDoc):
     doc.body = out
 
 
-def _make_block(kind, blk, table_caption):
+def _make_block(kind, blk, table_caption, base_dir: str = ""):
     if kind == "pagebreak":
         return model.PageBreak()
     if kind == "para":
@@ -1117,6 +1612,9 @@ def _make_block(kind, blk, table_caption):
         ptext = _spans_text(spans)
         if _is_page_break_marker(ptext.strip()):
             return model.PageBreak()
+        m_braced_note = _BRACED_NOTE_RE.match(ptext)
+        if m_braced_note:
+            raise ValueError("正文注不要写进 `{}`，请写成 `注：...` 或 `注1：...`。")
         m = _NOTE_RE.match(ptext)
         if m:
             content_spans = _strip_leading(spans, _marker_content_start(ptext, m.end()))
@@ -1153,7 +1651,7 @@ def _make_block(kind, blk, table_caption):
         cap, raw_anchor = _pop_anchor(blk[1])
         _assert_clean_caption("fig", cap, "图题")
         anchor = _parse_typed_anchor(raw_anchor, "fig", "图题")
-        return model.Figure(caption=cap, path=blk[2], anchor_id=anchor)
+        return model.Figure(caption=cap, path=_resolve_asset_path(blk[2], base_dir), anchor_id=anchor)
     if kind == "list":
         ordered, items, level = blk[1], blk[2], blk[3]
         return model.ListBlock(
@@ -1167,6 +1665,10 @@ def _make_block(kind, blk, table_caption):
         row_colspans = blk[4] if len(blk) > 4 else []
         header_parts = blk[5] if len(blk) > 5 else []
         row_parts = blk[6] if len(blk) > 6 else []
+        cell_rows = blk[7] if len(blk) > 7 else []
+        header_row_count = blk[8] if len(blk) > 8 else (1 if header else 0)
+        border_outer = blk[9] if len(blk) > 9 else ""
+        border_inner = blk[10] if len(blk) > 10 else ""
         if table_caption is None:
             cap, anchor = "", ""
         else:
@@ -1180,6 +1682,10 @@ def _make_block(kind, blk, table_caption):
             row_colspans=row_colspans,
             header_parts=header_parts,
             row_parts=row_parts,
+            cell_rows=cell_rows,
+            header_row_count=header_row_count,
+            border_outer=border_outer,
+            border_inner=border_inner,
         )
     return None
 
@@ -1212,16 +1718,26 @@ def _iter_block_spans(blk):
         for note in blk.notes:
             yield from note.spans
     elif isinstance(blk, model.Figure):
-        for note in blk.notes:
-            yield from note.spans
+        if blk.unit is not None:
+            yield from blk.unit.spans
+        for item in blk.key_items:
+            yield from item.spans
+        for paragraph in blk.body_paragraphs:
+            yield from paragraph.spans
+            for note in paragraph.notes:
+                yield from note.spans
+        for footnote in blk.footnotes:
+            yield from footnote.spans
         if blk.source is not None:
             yield from blk.source.spans
     elif isinstance(blk, model.ListBlock):
         for item in blk.items:
             yield from item.spans
     elif isinstance(blk, model.TableModel):
-        for note in blk.notes:
-            yield from note.spans
+        if blk.unit is not None:
+            yield from blk.unit.spans
+        for footnote in blk.footnotes:
+            yield from footnote.spans
         if blk.source is not None:
             yield from blk.source.spans
         part_rows = []
@@ -1238,6 +1754,8 @@ def _iter_block_spans(blk):
                             target=part.target,
                             mode=part.mode,
                         )
+                    elif part.kind == "note":
+                        yield from part.spans
 
 
 def _collect_normative_refs(doc: model.StandardDoc):
