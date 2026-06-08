@@ -10,7 +10,7 @@ import unittest.mock as mock
 import zipfile
 import xml.etree.ElementTree as ET
 
-from md2std import cli, docx_builder, md_parser, model, word_postprocess
+from md2std import cli, docx_builder, md_parser, model, resources, word_postprocess
 
 
 def _build_docx_xml(markdown: str) -> str:
@@ -18,7 +18,7 @@ def _build_docx_xml(markdown: str) -> str:
     fd, path = tempfile.mkstemp(suffix=".docx")
     os.close(fd)
     try:
-        docx_builder.build(sdoc, cli._DEFAULT_TEMPLATE, path)
+        docx_builder.build_cover(sdoc, path)
         with zipfile.ZipFile(path) as zf:
             return zf.read("word/document.xml").decode("utf-8", errors="ignore")
     finally:
@@ -31,7 +31,7 @@ def _build_docx_parts(markdown: str) -> dict:
     fd, path = tempfile.mkstemp(suffix=".docx")
     os.close(fd)
     try:
-        docx_builder.build(sdoc, cli._DEFAULT_TEMPLATE, path)
+        docx_builder.build_cover(sdoc, path)
         with zipfile.ZipFile(path) as zf:
             return {
                 "document": zf.read("word/document.xml"),
@@ -40,20 +40,6 @@ def _build_docx_parts(markdown: str) -> dict:
     finally:
         if os.path.exists(path):
             os.remove(path)
-
-
-def _build_template_docx_xml(markdown: str, kind: str = "group") -> str:
-    sdoc = md_parser.parse(markdown)
-    fd, path = tempfile.mkstemp(suffix=".docx")
-    os.close(fd)
-    try:
-        docx_builder.build(sdoc, cli._resolve_default_template(kind), path, kind=kind)
-        with zipfile.ZipFile(path) as zf:
-            return zf.read("word/document.xml").decode("utf-8", errors="ignore")
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
-
 
 def _build_cover_docx_xml(markdown: str, kind: str = "group") -> str:
     sdoc = md_parser.parse(markdown)
@@ -754,75 +740,6 @@ class CrossReferenceDocxTest(unittest.TestCase):
         return "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}" + name
 
 
-class TemplateBackendDocxTest(unittest.TestCase):
-    _W_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-
-    def test_national_template_backend_uses_national_template_and_cleans_placeholders(self):
-        xml = _build_template_docx_xml(
-            "---\n"
-            "standard_type: 国家标准\n"
-            "number: GB/T 99999-2026\n"
-            "title: 国家模板测试标准\n"
-            "title_en: National template test standard\n"
-            "ics: \"27.010\"\n"
-            "ccs: F 10\n"
-            "publish_date: 2026-06-01\n"
-            "implement_date: 2026-07-01\n"
-            "publisher: 国家市场监督管理总局 国家标准化管理委员会\n"
-            "---\n"
-            "# 范围\n\n"
-            "正文。\n",
-            kind="national",
-        )
-
-        self.assertIn("中华人民共和国国家标准", xml)
-        self.assertIn("GB/T 99999-2026", xml)
-        self.assertIn("国家模板测试标准", xml)
-        self.assertIn("National template test standard", xml)
-        self.assertIn("27.010", xml)
-        self.assertIn("F 10", xml)
-        self.assertIn("2026-06-01发布", xml)
-        self.assertIn("2026-07-01实施", xml)
-        self.assertNotIn("国家市场监督管理总局", xml)
-        self.assertNotIn("国家标准化管理委员会", xml)
-        self.assertIn("国标发布单位", xml)
-        self.assertNotIn("点击此处添加", xml)
-        self.assertNotIn("本草案完成时间", xml)
-        self.assertNotIn("章标题", xml)
-        self.assertNotIn("条标题", xml)
-
-    def test_template_backend_inserts_body_standard_title_before_scope(self):
-        xml = _build_template_docx_xml(
-            "---\n"
-            "title: 模板正文标题测试标准\n"
-            "---\n"
-            "# 范围\n\n"
-            "正文。\n",
-            kind="group",
-        )
-        paragraphs = self._paragraphs(xml)
-        texts = [self._et_text(p) for p in paragraphs]
-        scope_index = next(i for i, text in enumerate(texts) if text == "范围")
-
-        self.assertEqual(texts[scope_index - 1], "模板正文标题测试标准")
-        self.assertEqual(self._jc_value(paragraphs[scope_index - 1]), "center")
-
-    def _paragraphs(self, xml: str):
-        root = ET.fromstring(xml)
-        body = root.find("w:body", self._W_NS)
-        return [p for p in body if p.tag == self._w_tag("p")]
-
-    def _et_text(self, element) -> str:
-        return "".join(t.text or "" for t in element.findall(".//w:t", self._W_NS))
-
-    def _jc_value(self, paragraph) -> str:
-        jc = paragraph.find("w:pPr/w:jc", self._W_NS)
-        return jc.get(self._w_tag("val")) if jc is not None else ""
-
-    def _w_tag(self, name: str) -> str:
-        return "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}" + name
-
-
 class CoverBackendDocxTest(unittest.TestCase):
     _W_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
@@ -1407,12 +1324,10 @@ class CoverBackendDocxTest(unittest.TestCase):
     def test_cover_blueprints_keep_complete_cover_section(self):
         pairs = [
             (self._first_existing_path(
-                cli._resolve_default_template("group"),
-                "2 团体标准——模板.docx",
+                *resources.template_candidates("template_group.docx"),
             ), docx_builder._default_cover_path("group")),
             (self._first_existing_path(
-                cli._resolve_default_template("national"),
-                "国家标准.docx",
+                *resources.template_candidates("template_national.docx"),
             ), docx_builder._default_cover_path("national")),
         ]
         for source_path, cover_path in pairs:
@@ -1629,6 +1544,17 @@ class CoverBackendDocxTest(unittest.TestCase):
 
 
 class CliPostprocessTest(unittest.TestCase):
+    def test_legacy_template_backend_flags_are_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_path = os.path.join(td, "input.md")
+            with open(input_path, "w", encoding="utf-8") as f:
+                f.write("# 范围\n\n正文。\n")
+
+            with mock.patch("sys.stderr"), self.assertRaises(SystemExit) as cm:
+                cli.main([input_path, "--backend", "template"])
+
+        self.assertEqual(cm.exception.code, 2)
+
     def test_cover_form_protection_flag_is_forwarded_and_can_override_metadata(self):
         with tempfile.TemporaryDirectory() as td:
             input_path = os.path.join(td, "input.md")

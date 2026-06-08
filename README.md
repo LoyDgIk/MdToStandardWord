@@ -82,8 +82,6 @@ md2std input.md -o output.docx --word-com-postprocess
 | `input` | 输入 Markdown 文件路径。 |
 | `-o, --output` | 输出 `.docx` 文件路径；未指定时输出到输入文件同名 `.docx`。 |
 | `--kind {auto,group,national}` | 标准类型；默认 `auto`，根据 `standard_type` 或标准编号推断。 |
-| `--backend {cover,template}` | 生成后端；默认 `cover`。 |
-| `-t, --template` | `template` 后端使用的完整模板 `.docx` 路径。 |
 | `--word-com-postprocess`, `--word-com` | 调用本机 Microsoft Word COM 更新域、重新分页并保存。 |
 | `--cover-form-protection` | 启用封面旧式 `FORMDROPDOWN` 表单域保护；仅保护封面节，正文节保持可编辑。 |
 | `--no-cover-form-protection` | 关闭封面表单域保护；用于覆盖 YAML 中的 `cover_form_protection: true`。 |
@@ -247,7 +245,8 @@ md2std/
   cli.py              命令行入口
   md_parser.py        Markdown 解析
   model.py            中间数据模型
-  docx_builder.py     DOCX 构建
+  docx_builder.py     DOCX 构建兼容入口
+  docx/               DOCX 内部生成模块
   resources.py        包内资源路径解析
   styles.py           Word 样式映射
   mathconv.py         LaTeX/MathML/OMML 转换
