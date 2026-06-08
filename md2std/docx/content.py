@@ -707,6 +707,13 @@ def _set_table_borders(table, outer: str = "thick", inner: str = "thin"):
     tblpr.append(borders)
 
 
+def _effective_cell_borders(cell_model: model.TableCell, is_header_row: bool = False) -> dict:
+    borders = dict(cell_model.borders or {})
+    if (cell_model.header or is_header_row) and "bottom" not in borders:
+        borders["bottom"] = "thick"
+    return borders
+
+
 def _set_cell_borders(cell, borders: dict):
     if not borders:
         return
@@ -876,10 +883,10 @@ def _emit_table_cell_notes(cell, doc, note_spans: List[List[model.Span]],
 
 
 def _emit_table_cell_content(word_cell, doc, cell_model: model.TableCell,
-                             footnote_ref_state=None):
+                             footnote_ref_state=None, is_header_row: bool = False):
     _set_cell_vertical_center(word_cell)
     _set_cell_margins(word_cell)
-    _set_cell_borders(word_cell, cell_model.borders)
+    _set_cell_borders(word_cell, _effective_cell_borders(cell_model, is_header_row))
     cp = word_cell.paragraphs[0]
     parts = cell_model.parts or _parts_from_text(cell_model.text)
     body_parts, note_spans = _split_table_cell_note_parts(parts)
@@ -1034,7 +1041,13 @@ def _emit_table_part(anchor: Paragraph, doc, tbl: model.TableModel, rows, row_pa
             if rowspan > 1 or colspan > 1:
                 word_cell = word_cell.merge(table.cell(r_i + rowspan - 1, c_i + colspan - 1))
             _reset_cell_to_single_paragraph(word_cell, doc, S.S_TABLE_CELL)
-            _emit_table_cell_content(word_cell, doc, cell_model, footnote_ref_state)
+            _emit_table_cell_content(
+                word_cell,
+                doc,
+                cell_model,
+                footnote_ref_state,
+                is_header_row=r_i < tbl.header_row_count,
+            )
     if include_addons:
         _emit_table_footer_addons(table, doc, tbl)
     anchor._p.addprevious(table._tbl)

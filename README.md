@@ -233,7 +233,7 @@ introduction: |
 </table>
 ```
 
-`data-border-outer`、`data-border-inner` 和单元格上的 `data-border-top/right/bottom/left` 支持 `none`、`thin`、`thick`。空单元格保持为空白；“同上”不做自动推断，按普通文本输出。
+`data-border-outer`、`data-border-inner` 和单元格上的 `data-border-top/right/bottom/left` 支持 `none`、`thin`、`thick`。表头单元格底线默认使用 `thick`，显式 `data-border-bottom` 可覆盖。空单元格保持为空白；“同上”不做自动推断，按普通文本输出。
 
 图表通用附加项应紧跟在目标表格或图片之后，目标由上一张表或图自动确定：
 

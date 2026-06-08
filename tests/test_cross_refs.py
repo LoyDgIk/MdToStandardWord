@@ -2029,6 +2029,28 @@ class CoverBackendDocxTest(unittest.TestCase):
         self.assertIn("<w:jc w:val=\"center\"/>", xml)
         self.assertIn("<w:jc w:val=\"left\"/>", xml)
 
+    def test_docx_table_header_cells_default_bottom_border_is_thick(self):
+        parts = _build_docx_parts(
+            "# 范围\n\n"
+            "{表：#tbl:gfm} 管道表\n\n"
+            "| 管道表头 | 值 |\n"
+            "| --- | --- |\n"
+            "| A | 1 |\n\n"
+            "{表：#tbl:html} HTML表\n\n"
+            "<table>"
+            "<tr><th>默认粗底线</th><th data-border-bottom=\"none\">显式无底线</th></tr>"
+            "<tr><td>A</td><td>1</td></tr>"
+            "</table>\n"
+        )
+        root = ET.fromstring(parts["document"])
+        gfm_header_cell = self._et_cell_containing(root, "管道表头")
+        html_header_cell = self._et_cell_containing(root, "默认粗底线")
+        override_cell = self._et_cell_containing(root, "显式无底线")
+
+        self.assertEqual(self._cell_border_attrs(gfm_header_cell, "bottom"), ("single", "8"))
+        self.assertEqual(self._cell_border_attrs(html_header_cell, "bottom"), ("single", "8"))
+        self.assertEqual(self._cell_border_attrs(override_cell, "bottom"), ("nil", "0"))
+
     def test_docx_html_table_rowspan_borders_empty_and_same(self):
         xml = _build_docx_xml(
             "# 范围\n\n"
@@ -2184,6 +2206,20 @@ class CoverBackendDocxTest(unittest.TestCase):
             if self._et_text(paragraph) == text:
                 return paragraph
         return None
+
+    def _et_cell_containing(self, root, text: str):
+        for cell in root.findall(".//w:tc", self._W_NS):
+            if text in self._et_text(cell):
+                return cell
+        return None
+
+    def _cell_border_attrs(self, cell, edge: str) -> tuple:
+        border = cell.find(f"w:tcPr/w:tcBorders/w:{edge}", self._W_NS)
+        self.assertIsNotNone(border)
+        return (
+            border.get(self._w_tag("val")),
+            border.get(self._w_tag("sz")),
+        )
 
     def _jc_value(self, paragraph) -> str:
         jc = paragraph.find("w:pPr/w:jc", self._W_NS)
