@@ -1062,6 +1062,7 @@ _FIGURE_CAP_RE = re.compile(r"^\s*\{\s*图\s*[:：]\s*#([^}\s]+)\s*\}\s+(.+?)\s*
 # 无标题条：显式声明编号层级，不手写具体编号。
 _UNTITLED_RE = re.compile(r"^\s*\{\s*无标题条\s*[:：]\s*([2-6])\s*\}\s*(\S.*)$", re.S)
 _LEGACY_UNTITLED_RE = re.compile(r"^\s*(\d+(?:\.\d+)+)\s+(\S.*)$", re.S)
+_UNTITLED_FORBIDDEN_BODY_CHAPTERS = {"范围", "规范性引用文件", "术语和定义", "符号和缩略语"}
 _APPENDIX_RE = re.compile(r"^\s*附录\s*(?:[A-ZＡ-Ｚ]\s*)?[（(]?\s*(规范性|资料性)\s*[)）]?\s*(.*)$")
 _INDEX_GROUP_RE = re.compile(r"^[A-Z]$")
 _INDEX_ITEM_RE = re.compile(r"^\s*(.+?)\s*[:：]\s*(.+?)\s*$")
@@ -1279,6 +1280,16 @@ def _parse_figure_body_paragraph(content: str) -> model.FigureBodyParagraph:
     return model.FigureBodyParagraph(spans=_inline_markup_to_spans(body), notes=notes)
 
 
+def _validate_untitled_clause_context(mode: str, chapter: str, raw_text: str) -> None:
+    if not _UNTITLED_RE.match((raw_text or "").strip()):
+        return
+    if mode == "body" and chapter in _UNTITLED_FORBIDDEN_BODY_CHAPTERS:
+        raise ValueError(
+            "`{无标题条:n}` 只能用于“术语和定义”之后的技术章或附录；"
+            "`# %s` 章内请直接写普通段落。" % chapter
+        )
+
+
 def _attach_figure_table_addon(target, addon):
     ref_type, kind, value = addon
     label = "表" if ref_type == "tbl" else "图"
@@ -1356,6 +1367,7 @@ def parse(text: str, source_path: str = "", base_dir: str = "") -> model.Standar
     expect_example_content = False
     in_example_block = False
     last_addon_target = None
+    current_body_chapter = ""
 
     idx = 0
     while idx < len(blocks):
@@ -1372,6 +1384,7 @@ def parse(text: str, source_path: str = "", base_dir: str = "") -> model.Standar
             if lvl == 1:
                 m_appx = _APPENDIX_RE.match(htext)
                 if m_appx:
+                    current_body_chapter = ""
                     nature = "normative" if m_appx.group(1) == "规范性" else "informative"
                     title = m_appx.group(2).strip()
                     cur_appendix = model.Appendix(
@@ -1383,6 +1396,7 @@ def parse(text: str, source_path: str = "", base_dir: str = "") -> model.Standar
                     idx += 1
                     continue
                 if htext == "参考文献":
+                    current_body_chapter = ""
                     mode = "references"
                     cur_index_group = None
                     expect_example_content = False
@@ -1390,6 +1404,7 @@ def parse(text: str, source_path: str = "", base_dir: str = "") -> model.Standar
                     idx += 1
                     continue
                 if htext == "索引":
+                    current_body_chapter = ""
                     mode = "index"
                     cur_index_group = None
                     expect_example_content = False
@@ -1397,6 +1412,7 @@ def parse(text: str, source_path: str = "", base_dir: str = "") -> model.Standar
                     idx += 1
                     continue
                 mode = "body"
+                current_body_chapter = htext
                 cur_index_group = None
                 expect_example_content = False
                 in_example_block = False
@@ -1502,6 +1518,9 @@ def parse(text: str, source_path: str = "", base_dir: str = "") -> model.Standar
                 if _TABLE_CAP_MARKER_RE.match(ptext):
                     raise ValueError("表题必须写成 `{表：#tbl:id} 标题`，且标题不要手写编号：%s。" %
                                      ptext)
+
+        if kind == "para":
+            _validate_untitled_clause_context(mode, current_body_chapter, _para_raw_text(blk))
 
         # --- 构造目标块 ---
         target_block = _make_block(kind, blk, table_caption, base_dir=asset_base_dir)

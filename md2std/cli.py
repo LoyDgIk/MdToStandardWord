@@ -41,7 +41,10 @@ def main(argv=None):
     with open(args.input, "r", encoding="utf-8") as f:
         text = f.read()
 
-    sdoc = md_parser.parse(text, source_path=args.input)
+    try:
+        sdoc = md_parser.parse(text, source_path=args.input)
+    except ValueError as exc:
+        parser.error(str(exc))
     docx_builder.build_cover(
         sdoc,
         output,

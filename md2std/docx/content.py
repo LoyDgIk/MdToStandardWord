@@ -116,20 +116,20 @@ def _split_term_text(text: str):
 
 
 def _emit_term_title(anchor: Paragraph, doc, term: str, term_en: str = ""):
-    para = _new_paragraph_before(anchor, doc, S.S_TERM_1)
-    _set_numbering(para, S.NUM_BODY, 2)
-    para.add_run().add_break()          # 让自动编号 3.1 单独占一行
-    r = para.add_run(term)
+    number_para = _new_paragraph_before(anchor, doc, S.S_TERM_1)
+    _set_numbering(number_para, S.NUM_BODY, 2)
+    term_para = _new_paragraph_before(anchor, doc, S.S_PARA)
+    r = term_para.add_run(term)
     r.bold = True
     if term_en:
-        para.add_run("　")
-        er = para.add_run(term_en)
+        term_para.add_run("　")
+        er = term_para.add_run(term_en)
         er.bold = True
-    return para
+    return term_para
 
 
 def _emit_term(anchor: Paragraph, doc, spans):
-    """术语条目：编号(3.1)单独成行，下一行加粗中文术语 + 英文对应词。
+    """术语条目：编号(3.1)单独成段，下一段加粗中文术语 + 英文对应词。
 
     自动编号接入 numId=2 ilvl=2（术语为章 3 下的一级条）。
     """

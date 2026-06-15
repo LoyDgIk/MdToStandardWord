@@ -609,6 +609,12 @@ class CrossReferenceParserTest(unittest.TestCase):
     def test_untitled_clause_uses_explicit_level_marker(self):
         doc = md_parser.parse(
             "# 范围\n\n"
+            "本文件规定了地热温泉资源开发利用要求。\n\n"
+            "# 规范性引用文件\n\n"
+            "本文件没有规范性引用文件。\n\n"
+            "# 术语和定义\n\n"
+            "本文件没有需要界定的术语和定义。\n\n"
+            "# 要求\n\n"
             "## 一般要求\n\n"
             "{无标题条:3} 开发地热温泉资源前，应完成地质勘查。\n"
         )
@@ -616,6 +622,18 @@ class CrossReferenceParserTest(unittest.TestCase):
         clause = next(b for b in doc.body if isinstance(b, model.UntitledClause))
         self.assertEqual(clause.level, 3)
         self.assertEqual(clause.text, "开发地热温泉资源前，应完成地质勘查。")
+
+    def test_untitled_clause_is_rejected_in_foundational_chapters(self):
+        cases = (
+            ("范围", "# 范围\n\n{无标题条:2} 本文件规定了测试要求。\n"),
+            ("规范性引用文件", "# 规范性引用文件\n\n{无标题条:2} GB/T 1.1  标准化工作导则\n"),
+            ("术语和定义", "# 术语和定义\n\n{无标题条:2} 测试术语。\n"),
+            ("符号和缩略语", "# 符号和缩略语\n\n{无标题条:2} A 为面积。\n"),
+        )
+        for chapter, text in cases:
+            with self.subTest(chapter=chapter):
+                with self.assertRaisesRegex(ValueError, r"\{无标题条:n\}.*普通段落"):
+                    md_parser.parse(text)
 
     def test_legacy_untitled_clause_number_warns_and_stays_plain_paragraph(self):
         with self.assertWarnsRegex(UserWarning, "旧式无标题条手写编号"):
@@ -832,20 +850,34 @@ class CrossReferenceDocxTest(unittest.TestCase):
         self.assertIn("\\h \\* CHARFORMAT", xml)
 
     def test_term_chinese_and_english_terms_are_bold(self):
-        xml = _build_docx_xml(
+        parts = _build_docx_parts(
             "# 术语和定义\n\n"
             "## 地热温泉  geothermal hot spring\n\n"
             "出水温度不低于25 ℃的地下热水天然露头或人工揭露点。\n"
         )
-        root = ET.fromstring(xml)
+        root = ET.fromstring(parts["document"])
+        paragraphs = root.findall(".//w:p", self._W_NS)
         paragraph = self._et_paragraph_containing(root, "geothermal hot spring")
         self.assertIsNotNone(paragraph)
+        term_index = paragraphs.index(paragraph)
+        number_paragraph = paragraphs[term_index - 1]
         bold_texts = [
             "".join(t.text or "" for t in run.findall(".//w:t", self._W_NS))
             for run in paragraph.findall("w:r", self._W_NS)
             if run.find("w:rPr/w:b", self._W_NS) is not None
         ]
 
+        self.assertEqual(self._et_text(number_paragraph), "")
+        self.assertIsNotNone(number_paragraph.find("w:pPr/w:numPr", self._W_NS))
+        self.assertEqual(
+            self._paragraph_style(number_paragraph),
+            self._style_id_by_name(parts["styles"], "标准文件_术语条一"),
+        )
+        self.assertIsNone(paragraph.find("w:pPr/w:numPr", self._W_NS))
+        self.assertEqual(
+            self._paragraph_style(paragraph),
+            self._style_id_by_name(parts["styles"], "标准文件_段"),
+        )
         self.assertIn("地热温泉", bold_texts)
         self.assertIn("geothermal hot spring", bold_texts)
 
@@ -2470,6 +2502,21 @@ class CliPostprocessTest(unittest.TestCase):
 
                 self.assertEqual(cli.main([input_path, "-o", output_path, "--word-com-postprocess"]), 0)
                 post.assert_called_once_with(output_path)
+
+    def test_cli_reports_untitled_clause_in_scope_before_building(self):
+        with tempfile.TemporaryDirectory() as td:
+            input_path = os.path.join(td, "input.md")
+            output_path = os.path.join(td, "output.docx")
+            with open(input_path, "w", encoding="utf-8") as f:
+                f.write("# 范围\n\n{无标题条:2} 本文件规定了测试要求。\n")
+
+            with mock.patch("sys.stderr"), \
+                 mock.patch("md2std.docx_builder.build_cover") as build_cover, \
+                 self.assertRaises(SystemExit) as cm:
+                cli.main([input_path, "-o", output_path])
+
+        self.assertEqual(cm.exception.code, 2)
+        build_cover.assert_not_called()
 
     def test_word_postprocess_replaces_target_only_after_temp_copy_success(self):
         with tempfile.TemporaryDirectory() as td:
