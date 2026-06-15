@@ -63,6 +63,7 @@ class TableCell:
     colspan: int = 1
     rowspan: int = 1
     borders: dict = field(default_factory=dict)
+    align: str = ""
     header: bool = False
 
 
@@ -225,13 +226,15 @@ class Term:
     """术语条目（术语和定义章内）。
 
     term     中文术语
-    term_en  英文对应词（可空）
+    term_en  英文对应词纯文本（可空）
+    term_en_spans 英文对应词行内格式（用于保留拉丁学名斜体等）
     definition 定义段落 spans
     notes    可选注
     source   可选来源
     """
     term: str
     term_en: str = ""
+    term_en_spans: List[Span] = field(default_factory=list)
     definition: List[Span] = field(default_factory=list)
     notes: List[Note] = field(default_factory=list)
     source: Optional[Source] = None

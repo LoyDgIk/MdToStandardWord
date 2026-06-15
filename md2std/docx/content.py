@@ -115,7 +115,38 @@ def _split_term_text(text: str):
     return (text or "").strip(), ""
 
 
-def _emit_term_title(anchor: Paragraph, doc, term: str, term_en: str = ""):
+def _add_bold_term_runs(paragraph: Paragraph, spans: List[model.Span]):
+    from .. import mathconv
+    for sp in spans:
+        if isinstance(sp, model.RefSpan):
+            _add_typed_ref(paragraph, sp)
+            continue
+        if isinstance(sp, model.FormulaSpan):
+            omath = mathconv.latex_to_omml(sp.text)
+            if omath is not None:
+                paragraph._p.append(omath)
+            else:
+                run = paragraph.add_run(sp.text)
+                run.bold = True
+                if sp.italic:
+                    run.italic = True
+            continue
+        for i, piece in enumerate(sp.text.split("\n")):
+            if i > 0:
+                paragraph.add_run().add_break()
+            if piece:
+                run = paragraph.add_run(piece)
+                run.bold = True
+                if sp.italic:
+                    run.italic = True
+                if getattr(sp, "subscript", False):
+                    run.font.subscript = True
+                if getattr(sp, "superscript", False):
+                    run.font.superscript = True
+
+
+def _emit_term_title(anchor: Paragraph, doc, term: str, term_en: str = "",
+                     term_en_spans: Optional[List[model.Span]] = None):
     number_para = _new_paragraph_before(anchor, doc, S.S_TERM_1)
     _set_numbering(number_para, S.NUM_BODY, 2)
     term_para = _new_paragraph_before(anchor, doc, S.S_PARA)
@@ -123,8 +154,8 @@ def _emit_term_title(anchor: Paragraph, doc, term: str, term_en: str = ""):
     r.bold = True
     if term_en:
         term_para.add_run("　")
-        er = term_para.add_run(term_en)
-        er.bold = True
+        spans = term_en_spans or [model.Span(term_en)]
+        _add_bold_term_runs(term_para, spans)
     return term_para
 
 
@@ -138,7 +169,7 @@ def _emit_term(anchor: Paragraph, doc, spans):
 
 
 def _emit_term_entry(anchor: Paragraph, doc, term: model.Term):
-    _emit_term_title(anchor, doc, term.term, term.term_en)
+    _emit_term_title(anchor, doc, term.term, term.term_en, term.term_en_spans)
     if term.definition:
         _new_paragraph_before(anchor, doc, S.S_PARA, spans=term.definition)
     _emit_note_group(anchor, doc, term.notes)
@@ -737,9 +768,33 @@ def _set_row_repeat_header(row):
         trpr.append(hdr)
 
 
+_TABLE_ALIGN_BY_NAME = {
+    "left": WD_ALIGN_PARAGRAPH.LEFT,
+    "center": WD_ALIGN_PARAGRAPH.CENTER,
+    "right": WD_ALIGN_PARAGRAPH.RIGHT,
+    "decimal": WD_ALIGN_PARAGRAPH.RIGHT,
+}
+
+
 def _cell_is_long_text(text: str, colspan: int = 1) -> bool:
     text = (text or "").strip()
-    return colspan > 1 or len(text) > 18 or any(mark in text for mark in "，。；：、（）()")
+    return (
+        "\n" in text
+        or colspan > 1
+        or len(text) > 18
+        or any(mark in text for mark in "，。；：、（）()；:;")
+    )
+
+
+def _table_cell_alignment(cell_model: model.TableCell, is_header_row: bool = False):
+    explicit = (cell_model.align or "").strip().lower()
+    if explicit in _TABLE_ALIGN_BY_NAME:
+        return _TABLE_ALIGN_BY_NAME[explicit]
+    if cell_model.header or is_header_row:
+        return WD_ALIGN_PARAGRAPH.CENTER
+    if _cell_is_long_text(cell_model.text, cell_model.colspan):
+        return WD_ALIGN_PARAGRAPH.LEFT
+    return WD_ALIGN_PARAGRAPH.CENTER
 
 
 def _parts_from_text(text: str) -> List[model.TableCellPart]:
@@ -899,11 +954,7 @@ def _emit_table_cell_content(word_cell, doc, cell_model: model.TableCell,
             _emit_table_cell_notes(word_cell, doc, note_spans, first_para=cp)
         return
     _set_paragraph_style(doc, cp, S.S_TABLE_CELL)
-    cp.alignment = (
-        WD_ALIGN_PARAGRAPH.LEFT
-        if not cell_model.header and _cell_is_long_text(cell_model.text, cell_model.colspan)
-        else WD_ALIGN_PARAGRAPH.CENTER
-    )
+    cp.alignment = _table_cell_alignment(cell_model, is_header_row)
     _emit_table_cell_parts(cp, doc, parts, footnote_ref_state)
 
 
@@ -979,6 +1030,7 @@ def _legacy_cell_rows(tbl: model.TableModel, rows, row_parts, row_colspans):
                 text=text,
                 parts=header_parts[i] if i < len(header_parts) else _parts_from_text(text),
                 colspan=header_spans[i] if i < len(header_spans) else 1,
+                align="",
                 header=True,
             )
             for i, text in enumerate(tbl.header)
@@ -991,6 +1043,7 @@ def _legacy_cell_rows(tbl: model.TableModel, rows, row_parts, row_colspans):
                 text=text,
                 parts=parts_row[i] if i < len(parts_row) else _parts_from_text(text),
                 colspan=spans[i] if i < len(spans) else 1,
+                align="",
             )
             for i, text in enumerate(row)
         ])

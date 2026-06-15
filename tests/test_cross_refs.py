@@ -136,11 +136,30 @@ class CrossReferenceParserTest(unittest.TestCase):
 
         self.assertEqual(term.term, "地热温泉")
         self.assertEqual(term.term_en, "geothermal hot spring")
+        self.assertEqual("".join(s.text for s in term.term_en_spans), "geothermal hot spring")
+        self.assertFalse(any(s.italic for s in term.term_en_spans))
         self.assertEqual("".join(s.text for s in term.definition), "出水温度不低于25 ℃的地下热水。")
         self.assertEqual(len(term.notes), 1)
         self.assertEqual("".join(s.text for s in term.notes[0].spans), "用于资源开发利用语境。")
         self.assertIsNotNone(term.source)
         self.assertEqual(term.source.text, "[来源：GB/T 11615—2010，3.1，有修改]")
+
+    def test_term_english_spans_preserve_markdown_italic(self):
+        doc = md_parser.parse(
+            "# 术语和定义\n\n"
+            "{术语：大肠埃希氏菌 | *Escherichia coli*}\n\n"
+            "一种常见指示菌。\n\n"
+            "## 耐热大肠菌群  thermotolerant coliform bacteria\n\n"
+            "在规定条件下可生长的菌群。\n"
+        )
+
+        terms = [b for b in doc.body if isinstance(b, model.Term)]
+
+        self.assertEqual(terms[0].term_en, "Escherichia coli")
+        self.assertEqual("".join(s.text for s in terms[0].term_en_spans), "Escherichia coli")
+        self.assertTrue(any(s.italic for s in terms[0].term_en_spans))
+        self.assertEqual(terms[1].term_en, "thermotolerant coliform bacteria")
+        self.assertFalse(any(s.italic for s in terms[1].term_en_spans))
 
     def test_inline_double_dollar_formula_renders_as_omml(self):
         doc = md_parser.parse("# 范围\n\n变量 $$T_r$$ 与 $$Q_e$$ 应统一说明。\n")
@@ -214,7 +233,7 @@ class CrossReferenceParserTest(unittest.TestCase):
             "<table data-border-outer=\"thick\" data-border-inner=\"thin\">"
             "<tr><th rowspan=\"2\" data-border-right=\"thick\">类别</th><th colspan=\"2\">指标</th></tr>"
             "<tr><th>值</th><th data-border-bottom=\"none\">备注</th></tr>"
-            "<tr><td>一类</td><td></td><td>同上</td></tr>"
+            "<tr><td data-align=\"left\">一类</td><td data-align=\"right\"></td><td data-align=\"decimal\">同上</td></tr>"
             "</table>"
         )
 
@@ -230,6 +249,31 @@ class CrossReferenceParserTest(unittest.TestCase):
         self.assertEqual(table.rows[-1], ["一类", "", "同上"])
         self.assertEqual(table.cell_rows[-1][1].text, "")
         self.assertEqual(table.cell_rows[-1][2].text, "同上")
+        self.assertEqual(table.cell_rows[-1][0].align, "left")
+        self.assertEqual(table.cell_rows[-1][1].align, "right")
+        self.assertEqual(table.cell_rows[-1][2].align, "decimal")
+
+    def test_table_cell_alignment_markers_are_structured(self):
+        html_doc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:align} 对齐表\n\n"
+            "<table><tr><th>项目</th><th>值</th></tr>"
+            "<tr><td data-align=\"left\">说明</td><td data-align=\"right\">12.5</td></tr>"
+            "</table>"
+        )
+        html_table = next(b for b in html_doc.body if isinstance(b, model.TableModel))
+        self.assertEqual(html_table.cell_rows[1][0].align, "left")
+        self.assertEqual(html_table.cell_rows[1][1].align, "right")
+
+        gfm_doc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:gfm-align} GFM对齐表\n\n"
+            "| 左 | 中 | 右 |\n"
+            "| :--- | :---: | ---: |\n"
+            "| A | B | C |\n"
+        )
+        gfm_table = next(b for b in gfm_doc.body if isinstance(b, model.TableModel))
+        self.assertEqual([cell.align for cell in gfm_table.cell_rows[0]], ["left", "center", "right"])
 
     def test_html_table_rejects_invalid_spans_and_borders(self):
         with self.assertRaisesRegex(ValueError, "rowspan 必须为正整数"):
@@ -249,6 +293,12 @@ class CrossReferenceParserTest(unittest.TestCase):
                 "# 范围\n\n"
                 "{表：#tbl:bad} 坏表\n\n"
                 "<table><tr><td data-border-left=\"wide\">A</td></tr></table>"
+            )
+        with self.assertRaisesRegex(ValueError, "data-align 只支持"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "{表：#tbl:bad} 坏表\n\n"
+                "<table><tr><td data-align=\"justify\">A</td></tr></table>"
             )
 
     def test_explicit_example_end_keeps_multi_block_example_content(self):
@@ -880,6 +930,37 @@ class CrossReferenceDocxTest(unittest.TestCase):
         )
         self.assertIn("地热温泉", bold_texts)
         self.assertIn("geothermal hot spring", bold_texts)
+        english_run = next(
+            run for run in paragraph.findall("w:r", self._W_NS)
+            if "".join(t.text or "" for t in run.findall(".//w:t", self._W_NS)) == "geothermal hot spring"
+        )
+        self.assertIsNone(english_run.find("w:rPr/w:i", self._W_NS))
+
+    def test_term_latin_scientific_name_is_bold_and_italic(self):
+        parts = _build_docx_parts(
+            "# 术语和定义\n\n"
+            "{术语：大肠埃希氏菌 | *Escherichia coli*}\n\n"
+            "一种常见指示菌。\n\n"
+            "{术语：耐热大肠菌群 | thermotolerant coliform bacteria}\n\n"
+            "在规定条件下可生长的菌群。\n"
+        )
+        root = ET.fromstring(parts["document"])
+        latin_paragraph = self._et_paragraph_containing(root, "Escherichia coli")
+        ordinary_paragraph = self._et_paragraph_containing(root, "thermotolerant coliform bacteria")
+
+        latin_run = next(
+            run for run in latin_paragraph.findall("w:r", self._W_NS)
+            if "".join(t.text or "" for t in run.findall(".//w:t", self._W_NS)) == "Escherichia coli"
+        )
+        ordinary_run = next(
+            run for run in ordinary_paragraph.findall("w:r", self._W_NS)
+            if "".join(t.text or "" for t in run.findall(".//w:t", self._W_NS)) == "thermotolerant coliform bacteria"
+        )
+
+        self.assertIsNotNone(latin_run.find("w:rPr/w:b", self._W_NS))
+        self.assertIsNotNone(latin_run.find("w:rPr/w:i", self._W_NS))
+        self.assertIsNotNone(ordinary_run.find("w:rPr/w:b", self._W_NS))
+        self.assertIsNone(ordinary_run.find("w:rPr/w:i", self._W_NS))
 
     def test_explicit_term_marker_emits_term_definition_note_and_source(self):
         xml = _build_docx_xml(
@@ -2060,6 +2141,33 @@ class CoverBackendDocxTest(unittest.TestCase):
         self.assertIn("<w:vAlign w:val=\"center\"/>", xml)
         self.assertIn("<w:jc w:val=\"center\"/>", xml)
         self.assertIn("<w:jc w:val=\"left\"/>", xml)
+
+    def test_docx_table_cell_alignment_defaults_and_overrides(self):
+        parts = _build_docx_parts(
+            "# 范围\n\n"
+            "{表：#tbl:align} 对齐表\n\n"
+            "<table>"
+            "<tr><th>表头</th><th>数值</th><th>说明</th><th>显式左</th><th>显式右</th><th>小数列</th></tr>"
+            "<tr><td>A</td><td>12.5</td><td>应符合运行、维护和记录要求。</td>"
+            "<td data-align=\"left\">短值</td><td data-align=\"right\">98.6</td>"
+            "<td data-align=\"decimal\">3.14</td></tr>"
+            "</table>"
+        )
+        root = ET.fromstring(parts["document"])
+
+        def cell_jc(text: str) -> str:
+            cell = self._et_cell_containing(root, text)
+            self.assertIsNotNone(cell)
+            para = cell.find("w:p", self._W_NS)
+            self.assertIsNotNone(para)
+            return self._jc_value(para)
+
+        self.assertEqual(cell_jc("表头"), "center")
+        self.assertEqual(cell_jc("12.5"), "center")
+        self.assertEqual(cell_jc("应符合运行、维护和记录要求。"), "left")
+        self.assertEqual(cell_jc("短值"), "left")
+        self.assertEqual(cell_jc("98.6"), "right")
+        self.assertEqual(cell_jc("3.14"), "right")
 
     def test_docx_table_header_cells_default_bottom_border_is_thick(self):
         parts = _build_docx_parts(

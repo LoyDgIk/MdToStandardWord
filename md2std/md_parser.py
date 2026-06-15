@@ -603,6 +603,7 @@ def _parse_table(tokens, start):
             cur_cells.append(model.TableCell(
                 text=txt,
                 parts=parts,
+                align=_parse_table_cell_align(_token_attr(tokens[i], "style"), "style") if _token_attr(tokens[i], "style") else "",
                 header=tt == "th_open",
             ))
         i += 1
@@ -833,6 +834,7 @@ def _table_parts_text(parts: List[model.TableCellPart]) -> str:
 
 
 _BORDER_VALUES = {"none", "thin", "thick"}
+_ALIGN_VALUES = {"left", "center", "right", "decimal"}
 
 
 def _parse_positive_int_attr(value: str, attr_name: str) -> int:
@@ -855,6 +857,26 @@ def _parse_border_attr(value: str, attr_name: str) -> str:
     return raw
 
 
+def _parse_table_cell_align(value: str, attr_name: str) -> str:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return ""
+    m = re.search(r"text-align\s*:\s*(left|center|right)", raw)
+    if m:
+        return m.group(1)
+    if raw not in _ALIGN_VALUES:
+        raise ValueError("%s 只支持 left、center、right、decimal：%s。" % (attr_name, raw))
+    return raw
+
+
+def _token_attr(token, name: str) -> str:
+    try:
+        value = token.attrGet(name)
+    except Exception:
+        value = None
+    return value or ""
+
+
 def _html_attrs(attrs):
     return {str(k).lower(): (v if v is not None else "") for k, v in attrs}
 
@@ -875,6 +897,7 @@ class _HtmlTableParser(HTMLParser):
         self._cell_colspan = 1
         self._cell_rowspan = 1
         self._cell_borders = {}
+        self._cell_align = ""
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
@@ -903,6 +926,7 @@ class _HtmlTableParser(HTMLParser):
                 )
                 if value
             }
+            self._cell_align = _parse_table_cell_align(attr_map.get("data-align", ""), "data-align")
         elif tag == "eq" and self._capture and self._cell is not None:
             self._cell.append("<eq>")
         elif tag == "br" and self._capture and self._cell is not None:
@@ -919,6 +943,7 @@ class _HtmlTableParser(HTMLParser):
                 "colspan": self._cell_colspan,
                 "rowspan": self._cell_rowspan,
                 "borders": dict(self._cell_borders),
+                "align": self._cell_align,
                 "header": self._cell_is_header,
             })
             self._cell = None
@@ -927,6 +952,7 @@ class _HtmlTableParser(HTMLParser):
             self._cell_colspan = 1
             self._cell_rowspan = 1
             self._cell_borders = {}
+            self._cell_align = ""
         elif tag == "eq" and self._capture and self._cell is not None:
             self._cell.append("</eq>")
         elif tag == "tr" and self._row is not None:
@@ -948,6 +974,7 @@ def _html_table_cell_from_raw(cell) -> model.TableCell:
         colspan=cell["colspan"],
         rowspan=cell["rowspan"],
         borders=cell["borders"],
+        align=cell.get("align", ""),
         header=cell["header"],
     )
 
@@ -1570,29 +1597,58 @@ def parse(text: str, source_path: str = "", base_dir: str = "") -> model.Standar
     return doc
 
 
-def _parse_term_title(text: str):
-    value = (text or "").strip()
+def _trim_text_range(text: str, start: int, end: int) -> Tuple[int, int]:
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return start, end
+
+
+def _strip_spans(spans: List[model.Span]) -> List[model.Span]:
+    text = _spans_text(spans)
+    start, end = _trim_text_range(text, 0, len(text))
+    return _slice_spans(spans, start, end)
+
+
+def _parse_term_title_spans(spans: List[model.Span]):
+    clean_spans = _strip_spans(spans)
+    value = _spans_text(clean_spans)
     m = _TERM_SPLIT_RE.match(value)
     if m:
-        return m.group(1).strip(), m.group(2).strip()
-    return value, ""
+        en_start, en_end = _trim_text_range(value, m.start(2), m.end(2))
+        term_en_spans = _strip_spans(_slice_spans(clean_spans, en_start, en_end))
+        return m.group(1).strip(), _spans_text(term_en_spans), term_en_spans
+    return value.strip(), "", []
+
+
+def _parse_term_title(text: str):
+    term, term_en, _term_en_spans = _parse_term_title_spans([model.Span(text or "")])
+    return term, term_en
 
 
 def _term_marker_text(blk) -> str:
+    return _spans_text(_term_marker_spans(blk)).strip()
+
+
+def _term_marker_spans(blk) -> List[model.Span]:
     if not isinstance(blk, model.Paragraph):
-        return ""
-    m = _TERM_MARKER_RE.match(_spans_text(blk.spans).strip())
-    return m.group(1).strip() if m else ""
+        return []
+    text = _spans_text(blk.spans)
+    m = _TERM_MARKER_RE.match(text)
+    if not m:
+        return []
+    return _strip_spans(_slice_spans(blk.spans, m.start(1), m.end(1)))
 
 
 def _term_from_start_block(blk) -> model.Term:
     if isinstance(blk, model.Heading) and blk.level == 2:
-        term, term_en = _parse_term_title(blk.text)
-        return model.Term(term=term, term_en=term_en)
-    marker = _term_marker_text(blk)
-    if marker:
-        term, term_en = _parse_term_title(marker)
-        return model.Term(term=term, term_en=term_en)
+        term, term_en, term_en_spans = _parse_term_title_spans(blk.spans)
+        return model.Term(term=term, term_en=term_en, term_en_spans=term_en_spans)
+    marker_spans = _term_marker_spans(blk)
+    if marker_spans:
+        term, term_en, term_en_spans = _parse_term_title_spans(marker_spans)
+        return model.Term(term=term, term_en=term_en, term_en_spans=term_en_spans)
     return None
 
 

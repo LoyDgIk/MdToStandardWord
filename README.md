@@ -200,6 +200,12 @@ introduction: |
 [来源：GB/T 11615—2010，3.1，有修改]
 ```
 
+普通英文对应词不要加斜体；拉丁学名、生物分类学名称等需要斜体时，在英文对应词中使用 Markdown 斜体：
+
+```md
+{术语：大肠埃希氏菌 | *Escherichia coli*}
+```
+
 兼容旧式二级标题写法：
 
 ```md
@@ -243,12 +249,13 @@ introduction: |
   <tr>
     <td>一类</td>
     <td></td>
-    <td>同上</td>
+    <td data-align="left">同上</td>
   </tr>
 </table>
 ```
 
 `data-border-outer`、`data-border-inner` 和单元格级 `data-border-top/right/bottom/left` 支持 `none`、`thin`、`thick`。
+表头默认居中，正文短值、数字和代码默认居中，较长说明性文字默认左对齐。HTML 单元格可用 `data-align="left|center|right|decimal"` 显式覆盖；`decimal` 作为数字列控制，当前按右对齐输出。
 
 ### 图片和分图
 
