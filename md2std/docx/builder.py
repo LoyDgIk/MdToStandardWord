@@ -46,7 +46,7 @@ def build_cover(
     end_line_image = _read_cover_end_line_image(output_path, resolved_kind)
 
     doc = Document(output_path)
-    _configure_standard_styles(doc)
+    _configure_standard_styles(doc, resolved_kind)
 
     cover_info = _apply_cover_fields(doc, sdoc.meta, kind=resolved_kind)
     _ensure_cover_publisher(doc, sdoc.meta.publisher, cover_info, kind=resolved_kind)

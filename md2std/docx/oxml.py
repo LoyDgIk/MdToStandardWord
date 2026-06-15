@@ -183,14 +183,116 @@ def _first_existing_path(candidates: List[str], label: str) -> str:
     raise FileNotFoundError("找不到%s：%s" % (label, "；".join(candidates)))
 
 
-def _configure_standard_styles(doc):
+def _configure_standard_styles(doc, kind: str = "group"):
     # 模板自带的破折号列项/参考文献缩进偏大。这里仍使用模板样式和编号，
     # 只把编号级别缩进收敛到“自然段首行两字”附近。
+    _configure_standard_paragraph_rhythm(doc, kind)
     _clear_style_indent(doc, S.S_LIST_DASH)
     _clear_style_indent(doc, "标准文件_破折号列项（二级）")
     _fix_numbering_style_indent(doc, S.S_LIST_DASH, left_twips=600, hanging_twips=200)
     _fix_numbering_style_indent(doc, "标准文件_破折号列项（二级）", left_twips=920, hanging_twips=200)
     _fix_numbering_style_indent(doc, S.S_REF_ITEM, left_twips=620, hanging_twips=420)
+
+
+def _style_ppr(doc, style_name: str):
+    try:
+        style = doc.styles[style_name]
+    except KeyError:
+        return None
+    ppr = style.element.find(qn("w:pPr"))
+    if ppr is not None:
+        return ppr
+    ppr = OxmlElement("w:pPr")
+    rpr = style.element.find(qn("w:rPr"))
+    if rpr is not None:
+        rpr.addprevious(ppr)
+    else:
+        style.element.append(ppr)
+    return ppr
+
+
+def _set_style_spacing(doc, style_name: str, *,
+                       before: Optional[int] = None,
+                       after: Optional[int] = None,
+                       line: Optional[int] = None,
+                       line_rule: Optional[str] = None,
+                       clear_line_spacing_attrs: bool = False):
+    ppr = _style_ppr(doc, style_name)
+    if ppr is None:
+        return
+    spacing = ppr.find(qn("w:spacing"))
+    if spacing is None:
+        spacing = OxmlElement("w:spacing")
+        ppr.append(spacing)
+    if before is not None:
+        spacing.set(qn("w:before"), str(before))
+        if clear_line_spacing_attrs and qn("w:beforeLines") in spacing.attrib:
+            del spacing.attrib[qn("w:beforeLines")]
+    if after is not None:
+        spacing.set(qn("w:after"), str(after))
+        if clear_line_spacing_attrs and qn("w:afterLines") in spacing.attrib:
+            del spacing.attrib[qn("w:afterLines")]
+    if line is not None:
+        spacing.set(qn("w:line"), str(line))
+    if line_rule is not None:
+        spacing.set(qn("w:lineRule"), line_rule)
+
+
+def _configure_standard_paragraph_rhythm(doc, kind: str):
+    """Carry the original template rhythm onto generated standard styles.
+
+    The cover blueprints keep Normal at 20 pt fixed line spacing, while several
+    named standard body styles do not declare their own line spacing. Generated
+    paragraphs use those named styles directly, so make the inherited template
+    rhythm explicit and keep chapter spacing aligned with the original body
+    placeholders in the full templates.
+    """
+    body_styles = [
+        S.S_PARA,
+        S.S_LIST_DASH,
+        "标准文件_破折号列项（二级）",
+        S.S_LIST_LETTER,
+        S.S_LIST_NUMBER,
+        S.S_LIST_NUMBER_2,
+        S.S_LIST_NUMBER_3,
+        S.S_REF_ITEM,
+        S.S_EXAMPLE,
+        S.S_EXAMPLE_CONTENT,
+        S.S_UNTITLED_1,
+        S.S_UNTITLED_2,
+        S.S_UNTITLED_3,
+        S.S_UNTITLED_4,
+        S.S_UNTITLED_5,
+        S.S_TERM_1,
+        S.S_TERM_2,
+    ]
+    for style_name in body_styles:
+        _set_style_spacing(doc, style_name, before=0, after=0, line=400, line_rule="exact")
+
+    # Notes are smaller in the templates.
+    _set_style_spacing(doc, S.S_NOTE, before=0, after=0, line=300, line_rule="exact")
+    _set_style_spacing(doc, S.S_NOTE_X, before=0, after=0, line=300, line_rule="exact")
+
+    chapter_before_after = 312 if kind == "national" else 240
+    _set_style_spacing(
+        doc,
+        S.S_CHAPTER,
+        before=chapter_before_after,
+        after=chapter_before_after,
+        line=400,
+        line_rule="exact",
+        clear_line_spacing_attrs=True,
+    )
+    for style_name in (S.S_CLAUSE_1, S.S_CLAUSE_2, S.S_CLAUSE_3, S.S_CLAUSE_4, S.S_CLAUSE_5):
+        _set_style_spacing(doc, style_name, before=50, after=50, line=400, line_rule="exact")
+
+    for style_name in (
+        S.S_TABLE_CAPTION,
+        S.S_FIGURE_CAPTION,
+        S.S_APPENDIX_TABLE_CAPTION,
+        S.S_APPENDIX_FIGURE_CAPTION,
+    ):
+        _set_style_spacing(doc, style_name, before=50, after=50, line=400, line_rule="exact")
 
 
 

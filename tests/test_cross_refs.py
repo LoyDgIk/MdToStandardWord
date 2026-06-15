@@ -1913,6 +1913,61 @@ class CoverBackendDocxTest(unittest.TestCase):
         self.assertIsNone(self._style_ind_by_id(parts["styles"], "92"))
         self.assertIsNone(self._style_ind_by_id(parts["styles"], "93"))
 
+    def test_cover_backend_makes_body_spacing_match_original_templates(self):
+        group_parts = _build_cover_docx_parts("# 范围\n\n正文。\n", kind="group")
+        national_parts = _build_cover_docx_parts("# 范围\n\n正文。\n", kind="national")
+
+        group_body = self._style_spacing_by_name(group_parts["styles"], "标准文件_段")
+        group_chapter = self._style_spacing_by_name(group_parts["styles"], "标准文件_章标题")
+        group_clause = self._style_spacing_by_name(group_parts["styles"], "标准文件_一级条标题")
+        group_table_caption = self._style_spacing_by_name(group_parts["styles"], "标准文件_正文表标题")
+        group_note = self._style_spacing_by_name(group_parts["styles"], "标准文件_注：")
+        national_body = self._style_spacing_by_name(national_parts["styles"], "标准文件_段")
+        national_chapter = self._style_spacing_by_name(national_parts["styles"], "标准文件_章标题")
+
+        self.assertEqual(group_body, {
+            "before": "0",
+            "beforeLines": None,
+            "after": "0",
+            "afterLines": None,
+            "line": "400",
+            "lineRule": "exact",
+        })
+        self.assertEqual(group_chapter, {
+            "before": "240",
+            "beforeLines": None,
+            "after": "240",
+            "afterLines": None,
+            "line": "400",
+            "lineRule": "exact",
+        })
+        self.assertEqual(group_clause, {
+            "before": "50",
+            "beforeLines": "50",
+            "after": "50",
+            "afterLines": "50",
+            "line": "400",
+            "lineRule": "exact",
+        })
+        self.assertEqual(group_table_caption, group_clause)
+        self.assertEqual(group_note, {
+            "before": "0",
+            "beforeLines": None,
+            "after": "0",
+            "afterLines": None,
+            "line": "300",
+            "lineRule": "exact",
+        })
+        self.assertEqual(national_body, group_body)
+        self.assertEqual(national_chapter, {
+            "before": "312",
+            "beforeLines": None,
+            "after": "312",
+            "afterLines": None,
+            "line": "400",
+            "lineRule": "exact",
+        })
+
     def test_cover_backend_group_and_national_cover_metadata(self):
         cases = [
             (
@@ -2381,6 +2436,24 @@ class CoverBackendDocxTest(unittest.TestCase):
             name_el = style.find("w:name", self._W_NS)
             if name_el is not None and name_el.get(self._w_tag("val")) == name:
                 return style.get(self._w_tag("styleId"))
+        self.fail("找不到样式：%s" % name)
+
+    def _style_spacing_by_name(self, styles_xml: bytes, name: str) -> dict:
+        root = ET.fromstring(styles_xml)
+        for style in root.findall("w:style", self._W_NS):
+            name_el = style.find("w:name", self._W_NS)
+            if name_el is None or name_el.get(self._w_tag("val")) != name:
+                continue
+            spacing = style.find("w:pPr/w:spacing", self._W_NS)
+            self.assertIsNotNone(spacing)
+            return {
+                "before": spacing.get(self._w_tag("before")),
+                "beforeLines": spacing.get(self._w_tag("beforeLines")),
+                "after": spacing.get(self._w_tag("after")),
+                "afterLines": spacing.get(self._w_tag("afterLines")),
+                "line": spacing.get(self._w_tag("line")),
+                "lineRule": spacing.get(self._w_tag("lineRule")),
+            }
         self.fail("找不到样式：%s" % name)
 
     def _w_tag(self, name: str) -> str:
