@@ -238,6 +238,28 @@ def _set_style_spacing(doc, style_name: str, *,
         spacing.set(qn("w:lineRule"), line_rule)
 
 
+def _set_direct_paragraph_first_line(para: Paragraph, first_line_twips: int):
+    ppr = para._p.get_or_add_pPr()
+    ind = ppr.find(qn("w:ind"))
+    if ind is None:
+        ind = OxmlElement("w:ind")
+        ppr.append(ind)
+    for attr in ("left", "leftChars", "hanging", "hangingChars", "firstLineChars"):
+        key = qn("w:" + attr)
+        if ind.get(key) is not None:
+            del ind.attrib[key]
+    ind.set(qn("w:firstLine"), str(first_line_twips))
+
+
+def _apply_template_direct_paragraph_format(para: Paragraph, style_name: str):
+    """Apply direct paragraph formatting present on full-template placeholders."""
+    if style_name == S.S_PARA:
+        _set_direct_paragraph_first_line(para, 420)
+        return
+    if style_name in (S.S_CLAUSE_1, S.S_CLAUSE_2, S.S_CLAUSE_3, S.S_CLAUSE_4, S.S_CLAUSE_5):
+        _set_direct_paragraph_spacing(para, before=156, after=156)
+
+
 def _configure_standard_paragraph_rhythm(doc, kind: str):
     """Carry the original template rhythm onto generated standard styles.
 
@@ -355,7 +377,7 @@ def _add_ref_bookmark(para: Paragraph, bookmark_name: str, display_text: str = "
     r._r.append(it)
     r = para.add_run()
     fs = OxmlElement("w:fldChar"); fs.set(qn("w:fldCharType"), "separate"); r._r.append(fs)
-    para.add_run(display_text)
+    _add_text_run(para, display_text)
     r = para.add_run()
     fe = OxmlElement("w:fldChar"); fe.set(qn("w:fldCharType"), "end"); r._r.append(fe)
 
@@ -445,7 +467,7 @@ def _add_numbered_caption_ref(para: Paragraph, ref: model.RefSpan):
             display_text=label_placeholder,
             switches="\\r",
         )
-        para.add_run("　")
+        _add_text_run(para, "　")
         _add_ref_bookmark(para, text_bookmark, display_text="?")
         return
     if ref.mode == "label":
@@ -726,13 +748,13 @@ def _set_runs(paragraph: Paragraph, spans: List[model.Span]):
             if omath is not None:
                 paragraph._p.append(omath)
             else:
-                paragraph.add_run(sp.text)
+                _add_text_run(paragraph, sp.text)
             continue
         for i, piece in enumerate(sp.text.split("\n")):
             if i > 0:
                 paragraph.add_run().add_break()
             if piece:
-                r = paragraph.add_run(piece)
+                r = _add_text_run(paragraph, piece)
                 if sp.bold:
                     r.bold = True
                 if sp.italic:
@@ -769,15 +791,17 @@ def _add_styled_runs(paragraph: Paragraph, doc, style_name: str, spans: List[mod
             if omath is not None:
                 paragraph._p.append(omath)
             else:
-                run = paragraph.add_run(sp.text)
+                run = _add_text_run(paragraph, sp.text)
                 _apply_style_run_properties(doc, run, style_name)
+                _set_run_east_asia_hint(run)
             continue
         for i, piece in enumerate(sp.text.split("\n")):
             if i > 0:
                 paragraph.add_run().add_break()
             if piece:
-                run = paragraph.add_run(piece)
+                run = _add_text_run(paragraph, piece)
                 _apply_style_run_properties(doc, run, style_name)
+                _set_run_east_asia_hint(run)
                 if sp.bold:
                     run.bold = True
                 if sp.italic:
@@ -798,10 +822,11 @@ def _new_paragraph_before(anchor: Paragraph, doc, style_name: str,
         para.style = doc.styles[style_name]
     except KeyError:
         para.style = doc.styles[S.S_PARA]
+    _apply_template_direct_paragraph_format(para, style_name)
     if spans is not None:
         _set_runs(para, spans)
     elif text:
-        para.add_run(text)
+        _add_text_run(para, text)
     return para
 
 
@@ -851,6 +876,33 @@ def _set_run_east_asia_hint(run):
         rfonts = OxmlElement("w:rFonts")
         rpr.append(rfonts)
     rfonts.set(qn("w:hint"), "eastAsia")
+
+
+def _add_text_run(paragraph: Paragraph, text: str):
+    run = paragraph.add_run(text)
+    if text:
+        _set_run_east_asia_hint(run)
+    return run
+
+
+def _apply_east_asia_hint_to_text_runs(doc):
+    """Normalize generated text runs to the original templates' East Asian hint."""
+    for part in doc.part.package.parts:
+        element = getattr(part, "element", None)
+        if element is None:
+            continue
+        for run in element.iter(qn("w:r")):
+            if run.find(qn("w:t")) is None:
+                continue
+            rpr = run.find(qn("w:rPr"))
+            if rpr is None:
+                rpr = OxmlElement("w:rPr")
+                run.insert(0, rpr)
+            rfonts = rpr.find(qn("w:rFonts"))
+            if rfonts is None:
+                rfonts = OxmlElement("w:rFonts")
+                rpr.append(rfonts)
+            rfonts.set(qn("w:hint"), "eastAsia")
 
 
 def _section_title_after(title: str, kind: str) -> Optional[int]:

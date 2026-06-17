@@ -1049,6 +1049,7 @@ class CrossReferenceDocxTest(unittest.TestCase):
         self.assertLess(footnote_pos, source_pos)
         self.assertLess(source_pos, table_end)
         self.assertIn('<w:gridSpan w:val="2"', xml[table_pos:table_end])
+        caption_para = self._et_paragraph_containing(root, "测试表")
         unit_para = self._et_paragraph_containing(root, "单位为毫米")
         note_para = self._et_paragraph_containing(root, "单元格注引用")
         footnote_para = self._et_paragraph_containing(root, "表脚注的内容")
@@ -1061,6 +1062,8 @@ class CrossReferenceDocxTest(unittest.TestCase):
         footnote_row = self._et_table_row_containing(root, "表脚注的内容")
         source_row = self._et_table_row_containing(root, "表资料来源")
 
+        self.assertIsNotNone(caption_para.find("w:pPr/w:keepNext", self._W_NS))
+        self.assertIsNotNone(unit_para.find("w:pPr/w:keepNext", self._W_NS))
         self.assertEqual(self._jc_value(unit_para), "right")
         self.assertIn("第二条注", self._et_text(note_row))
         self.assertIsNot(note_row, source_row)
@@ -1127,6 +1130,7 @@ class CrossReferenceDocxTest(unittest.TestCase):
         source_style = self._style_id_by_name(parts["styles"], "标准文件_图表说明")
 
         self.assertEqual(self._jc_value(unit_para), "right")
+        self.assertIsNotNone(unit_para.find("w:pPr/w:keepNext", self._W_NS))
         self.assertEqual(self._paragraph_style(key_lead_para), para_style)
         self.assertEqual(self._paragraph_style(body_para), para_style)
         self.assertEqual(self._paragraph_style(note_para), note_style)
@@ -1968,6 +1972,31 @@ class CoverBackendDocxTest(unittest.TestCase):
             "lineRule": "exact",
         })
 
+    def test_cover_backend_carries_template_direct_paragraph_format_and_run_hint(self):
+        parts = _build_cover_docx_parts(
+            "# 范围\n\n"
+            "正文English。\n\n"
+            "## 条标题\n\n"
+            "条正文。\n"
+        )
+        root = ET.fromstring(parts["document"])
+        body_para = self._et_paragraph_containing(root, "正文English。")
+        clause_para = self._et_paragraph_containing(root, "条标题")
+
+        body_ind = body_para.find("w:pPr/w:ind", self._W_NS)
+        self.assertIsNotNone(body_ind)
+        self.assertEqual(body_ind.get(self._w_tag("firstLine")), "420")
+        self.assertIsNone(body_ind.get(self._w_tag("firstLineChars")))
+
+        body_run_fonts = body_para.find(".//w:rPr/w:rFonts", self._W_NS)
+        self.assertIsNotNone(body_run_fonts)
+        self.assertEqual(body_run_fonts.get(self._w_tag("hint")), "eastAsia")
+
+        clause_spacing = clause_para.find("w:pPr/w:spacing", self._W_NS)
+        self.assertIsNotNone(clause_spacing)
+        self.assertEqual(clause_spacing.get(self._w_tag("before")), "156")
+        self.assertEqual(clause_spacing.get(self._w_tag("after")), "156")
+
     def test_cover_backend_group_and_national_cover_metadata(self):
         cases = [
             (
@@ -2311,6 +2340,7 @@ class CoverBackendDocxTest(unittest.TestCase):
             self._paragraph_style(caption),
             self._style_id_by_name(parts["styles"], "标准文件_正文表标题"),
         )
+        self.assertIsNotNone(caption.find("w:pPr/w:keepNext", self._W_NS))
         self.assertNotEqual(self._num_id_value(caption), "0")
         self.assertNotIn("（续）", xml)
         self.assertEqual(xml.count("<w:tblHeader w:val=\"true\"/>"), 1)
@@ -2497,6 +2527,116 @@ class CoverBackendDocxTest(unittest.TestCase):
             word_postprocess._postprocess_document(object(), "dummy.docx")
 
         self.assertEqual(applied, [[first], [fresh_second]])
+
+    def test_word_postprocess_does_not_split_when_first_segment_has_one_body_row(self):
+        sdoc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:split} 测试表\n\n"
+            "| 唯一表头 | 值 |\n"
+            "| --- | --- |\n"
+            "| 一 | 1 |\n"
+            "| 二 | 2 |\n"
+            "| 三 | 3 |\n"
+        )
+        fd, path = tempfile.mkstemp(suffix=".docx")
+        os.close(fd)
+        try:
+            docx_builder.build_cover(sdoc, path)
+            changed = word_postprocess._apply_table_continuations(path, [
+                word_postprocess._TableContinuationPlan(
+                    table_index=2,
+                    row_breaks=[3],
+                    header_count=1,
+                    caption_text="表1　测试表（续）",
+                )
+            ])
+            with zipfile.ZipFile(path) as zf:
+                xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+        self.assertFalse(changed)
+        self.assertNotIn("表1　测试表（续）", xml)
+        self.assertEqual(xml.count("唯一表头"), 1)
+
+    def test_word_postprocess_does_not_split_when_tail_segment_has_one_body_row(self):
+        sdoc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:split} 测试表\n\n"
+            "| 唯一表头 | 值 |\n"
+            "| --- | --- |\n"
+            "| 一 | 1 |\n"
+            "| 二 | 2 |\n"
+            "| 三 | 3 |\n"
+        )
+        fd, path = tempfile.mkstemp(suffix=".docx")
+        os.close(fd)
+        try:
+            docx_builder.build_cover(sdoc, path)
+            changed = word_postprocess._apply_table_continuations(path, [
+                word_postprocess._TableContinuationPlan(
+                    table_index=2,
+                    row_breaks=[4],
+                    header_count=1,
+                    caption_text="表1　测试表（续）",
+                )
+            ])
+            with zipfile.ZipFile(path) as zf:
+                xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+        self.assertFalse(changed)
+        self.assertNotIn("表1　测试表（续）", xml)
+        self.assertEqual(xml.count("唯一表头"), 1)
+
+    def test_word_postprocess_balances_short_tail_by_moving_previous_row_to_continuation(self):
+        sdoc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:split} 测试表\n\n"
+            "| 唯一表头 | 值 |\n"
+            "| --- | --- |\n"
+            "| 一 | 1 |\n"
+            "| 二 | 2 |\n"
+            "| 三 | 3 |\n"
+            "| 四 | 4 |\n"
+            "| 五 | 5 |\n"
+        )
+        fd, path = tempfile.mkstemp(suffix=".docx")
+        os.close(fd)
+        try:
+            docx_builder.build_cover(sdoc, path)
+            changed = word_postprocess._apply_table_continuations(path, [
+                word_postprocess._TableContinuationPlan(
+                    table_index=2,
+                    row_breaks=[6],
+                    header_count=1,
+                    caption_text="表1　测试表（续）",
+                )
+            ])
+            with zipfile.ZipFile(path) as zf:
+                xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+        self.assertTrue(changed)
+        self.assertIn("表1　测试表（续）", xml)
+        self.assertEqual(xml.count("唯一表头"), 2)
+        root = ET.fromstring(xml)
+        continuation = self._et_paragraph_containing(root, "表1　测试表（续）")
+        self.assertIsNotNone(continuation.find("w:pPr/w:pageBreakBefore", self._W_NS))
+        split_tables = [
+            table for table in root.findall(".//w:tbl", self._W_NS)
+            if "唯一表头" in self._et_text(table)
+        ]
+        self.assertEqual(len(split_tables), 2)
+        self.assertIn("三", self._et_text(split_tables[0]))
+        self.assertNotIn("四", self._et_text(split_tables[0]))
+        self.assertIn("四", self._et_text(split_tables[1]))
+        self.assertIn("五", self._et_text(split_tables[1]))
 
     def test_cover_blueprints_keep_complete_cover_section(self):
         pairs = [

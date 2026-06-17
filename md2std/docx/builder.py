@@ -22,6 +22,7 @@ from .cover import (
     _enable_cover_form_field_protection,
 )
 from .oxml import (
+    _apply_east_asia_hint_to_text_runs,
     _configure_standard_styles,
     _enable_update_fields,
     _normalize_cover_page_number_for_odd_even_export,
@@ -56,6 +57,7 @@ def build_cover(
     _enable_update_fields(doc)
     _set_even_and_odd_headers(doc, sdoc.meta.odd_even_pages)
     _normalize_cover_page_number_for_odd_even_export(doc, sdoc.meta.odd_even_pages)
+    _apply_east_asia_hint_to_text_runs(doc)
     if _should_enable_cover_form_protection(sdoc.meta, cover_form_protection):
         _enable_cover_form_field_protection(doc)
     else:

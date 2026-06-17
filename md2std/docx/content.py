@@ -404,6 +404,7 @@ def _emit_figure_table_unit(anchor: Paragraph, doc, unit: model.FigureTableSourc
     para = _new_paragraph_before(anchor, doc, S.S_FIG_TABLE_SOURCE)
     para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     _set_runs(para, unit.spans)
+    return para
 
 
 def _set_keep_next_on_paragraph_element(p):
@@ -1110,9 +1111,11 @@ def _emit_table(anchor: Paragraph, doc, tbl: model.TableModel, appendix_letter=N
     """表格：标题编号由模板表题样式自动生成。"""
     style = S.S_APPENDIX_TABLE_CAPTION if appendix_letter else S.S_TABLE_CAPTION
     cap = _new_paragraph_before(anchor, doc, style)
+    _set_keep_next_on_paragraph_element(cap._p)
     _emit_style_numbered_caption(cap, doc, style, "tbl", tbl.anchor_id, tbl.caption or "")
     if tbl.unit is not None:
-        _emit_figure_table_unit(anchor, doc, tbl.unit)
+        unit_para = _emit_figure_table_unit(anchor, doc, tbl.unit)
+        _set_keep_next_on_paragraph_element(unit_para._p)
 
     row_parts = tbl.row_parts or [
         [_parts_from_text(cell) for cell in row]
@@ -1152,7 +1155,8 @@ def _emit_table(anchor: Paragraph, doc, tbl: model.TableModel, appendix_letter=N
 
 def _emit_figure(anchor: Paragraph, doc, fig: model.Figure, appendix_letter=None):
     if fig.unit is not None:
-        _emit_figure_table_unit(anchor, doc, fig.unit)
+        unit_para = _emit_figure_table_unit(anchor, doc, fig.unit)
+        _set_keep_next_on_paragraph_element(unit_para._p)
     if fig.subfigures:
         _emit_subfigures(anchor, doc, fig.subfigures, columns=fig.subfigure_columns)
     else:
@@ -1373,6 +1377,7 @@ def _emit_cover_index(anchor: Paragraph, doc, sdoc: model.StandardDoc, kind: str
 def _emit_document_end_line(anchor: Paragraph, doc, image_bytes: bytes):
     para = _new_paragraph_before(anchor, doc, S.S_PARA)
     para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _set_paragraph_left_indent(para, 0)
     para.add_run().add_picture(io.BytesIO(image_bytes))
 
 
