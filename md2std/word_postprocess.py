@@ -17,7 +17,7 @@ import tempfile
 import threading
 import zipfile
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 from lxml import etree as ET
 
@@ -27,6 +27,7 @@ _WD_ACTIVE_END_PAGE_NUMBER = 3
 _CONTINUATION_STYLE_NAME = "标准文件_表格续"
 _CONTINUATION_SUFFIX = "（续）"
 _WORD_COM_TIMEOUT_SECONDS = 180
+_MIN_BODY_ROWS_BEFORE_CONTINUATION = 2
 
 
 @dataclass
@@ -165,12 +166,14 @@ def _quit_word(word):
 
 def _postprocess_document(word, abs_path: str):
     """多轮后处理：测量真实分页 -> 拆续表 -> 重新分页，直到不再需要拆分。"""
-    max_iterations = 4
+    max_iterations = 20
     for _ in range(max_iterations):
         plans = _measure_table_continuations(word, abs_path)
         if not plans:
             return
-        if not _apply_table_continuations(abs_path, plans):
+        # 插入续表题会强制新页，可能改变后续所有表的分页位置。
+        # 因此每轮只处理文档中最早的一个计划，随后交给 Word 重新分页。
+        if not _apply_table_continuations(abs_path, plans[:1]):
             return
     # 最后一轮保存一次 Word 分页结果；若仍有极端超高行，避免无限循环。
     _measure_table_continuations(word, abs_path)
@@ -247,10 +250,13 @@ def _collect_table_continuation_plans(doc) -> List[_TableContinuationPlan]:
             continue
         header_count = _table_header_count(table, row_count)
         row_breaks = _table_row_page_breaks(doc, table, row_count, header_count)
-        if row_breaks:
+        if not row_breaks:
+            continue
+        valid_breaks = _valid_continuation_breaks(row_breaks, header_count, row_count)
+        if valid_breaks:
             plans.append(_TableContinuationPlan(
                 table_index=table_index,
-                row_breaks=row_breaks,
+                row_breaks=valid_breaks,
                 header_count=header_count,
                 caption_text=_continuation_caption_text(caption_text),
             ))
@@ -303,17 +309,26 @@ def _table_row_page_breaks(doc, table, row_count: int, header_count: int) -> Lis
     for row_index in range(1, row_count + 1):
         try:
             row = table.Rows(row_index)
-            page = doc.Range(row.Range.Start, row.Range.Start).Information(_WD_ACTIVE_END_PAGE_NUMBER)
+            start_page = doc.Range(row.Range.Start, row.Range.Start).Information(_WD_ACTIVE_END_PAGE_NUMBER)
+            end_page = doc.Range(row.Range.End, row.Range.End).Information(_WD_ACTIVE_END_PAGE_NUMBER)
         except Exception:
             continue
-        if not isinstance(page, int):
+        if not isinstance(start_page, int) or not isinstance(end_page, int):
             continue
-        if previous_page is not None and page != previous_page:
-            # 避免把“只有表头留在上一页”的表硬拆成续表；这种情况应另行整表前置。
-            if row_index > header_count + 1:
+        if previous_page is not None and (start_page != previous_page or end_page != start_page):
+            # Word 有时把整行视觉上推到下一页，但 row.Range.Start 仍报告上一页；
+            # 此时用 End 页码把断点前移到真实换页行。
+            if row_index > header_count:
                 breaks.append(row_index)
-        previous_page = page
+        previous_page = end_page
     return breaks
+
+
+def _has_enough_body_rows_before_break(row_index: int, header_count: int,
+                                       previous_break: Optional[int] = None) -> bool:
+    body_start = max(header_count + 1, 1)
+    segment_start = previous_break or body_start
+    return row_index - segment_start >= _MIN_BODY_ROWS_BEFORE_CONTINUATION
 
 
 def _apply_table_continuations(path: str, plans: List[_TableContinuationPlan]) -> bool:
@@ -379,12 +394,12 @@ def _split_table_element(table, plan: _TableContinuationPlan, style_id: str) -> 
     if len(rows) < 2:
         return []
 
-    valid_breaks = sorted(set(
-        br for br in plan.row_breaks
-        if plan.header_count < br <= len(rows)
-    ))
+    valid_breaks = _valid_continuation_breaks(plan.row_breaks, plan.header_count, len(rows))
     if not valid_breaks:
         return []
+    # 只应用当前分页测量得到的第一个断点。续表题会强制新页开始，
+    # 旧的后续断点在拆分后可能已经失效，需交给下一轮 Word 重新分页。
+    valid_breaks = valid_breaks[:1]
 
     start_rows = [1] + valid_breaks
     end_rows = valid_breaks + [len(rows) + 1]
@@ -402,6 +417,34 @@ def _split_table_element(table, plan: _TableContinuationPlan, style_id: str) -> 
             elements.append(_make_continuation_caption(table, plan.caption_text, style_id))
         elements.append(_make_table_with_rows(table, segment_rows))
     return elements if len(elements) > 1 else []
+
+
+def _valid_continuation_breaks(row_breaks: List[int], header_count: int,
+                               row_count: int) -> List[int]:
+    valid_breaks: List[int] = []
+    previous_break: Optional[int] = None
+    for br in sorted(set(row_breaks)):
+        if header_count >= br or br > row_count:
+            continue
+        if not _has_enough_body_rows_before_break(br, header_count, previous_break):
+            continue
+        valid_breaks.append(br)
+        previous_break = br
+    if valid_breaks and row_count - valid_breaks[-1] + 1 < _MIN_BODY_ROWS_BEFORE_CONTINUATION:
+        _rebalance_short_tail_break(valid_breaks, header_count, row_count)
+    return valid_breaks
+
+
+def _rebalance_short_tail_break(valid_breaks: List[int], header_count: int, row_count: int):
+    last_break = valid_breaks[-1]
+    adjusted = row_count - _MIN_BODY_ROWS_BEFORE_CONTINUATION + 1
+    if adjusted >= last_break:
+        return
+    previous_break = valid_breaks[-2] if len(valid_breaks) > 1 else None
+    if _has_enough_body_rows_before_break(adjusted, header_count, previous_break):
+        valid_breaks[-1] = adjusted
+    else:
+        valid_breaks.pop()
 
 
 def _make_table_with_rows(source_table, rows: List[ET.Element]):
