@@ -2355,6 +2355,149 @@ class CoverBackendDocxTest(unittest.TestCase):
         self.assertIsNotNone(continuation)
         self.assertIsNotNone(continuation.find("w:pPr/w:pageBreakBefore", self._W_NS))
 
+    def test_word_postprocess_applies_only_first_measured_break_per_iteration(self):
+        sdoc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:split} 测试表\n\n"
+            "| 唯一表头 | 值 |\n"
+            "| --- | --- |\n"
+            "| 一 | 1 |\n"
+            "| 二 | 2 |\n"
+            "| 三 | 3 |\n"
+            "| 四 | 4 |\n"
+            "| 五 | 5 |\n"
+            "| 六 | 6 |\n"
+        )
+        fd, path = tempfile.mkstemp(suffix=".docx")
+        os.close(fd)
+        try:
+            docx_builder.build_cover(sdoc, path)
+            changed = word_postprocess._apply_table_continuations(path, [
+                word_postprocess._TableContinuationPlan(
+                    table_index=2,
+                    row_breaks=[4, 6],
+                    header_count=1,
+                    caption_text="表1　测试表（续）",
+                )
+            ])
+            with zipfile.ZipFile(path) as zf:
+                xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+        self.assertTrue(changed)
+        self.assertEqual(xml.count("表1　测试表（续）"), 1)
+        self.assertEqual(xml.count("唯一表头"), 2)
+        root = ET.fromstring(xml)
+        split_tables = [
+            table for table in root.findall(".//w:tbl", self._W_NS)
+            if "唯一表头" in self._et_text(table)
+        ]
+        self.assertEqual(len(split_tables), 2)
+        self.assertIn("二", self._et_text(split_tables[0]))
+        self.assertNotIn("三", self._et_text(split_tables[0]))
+        self.assertIn("三", self._et_text(split_tables[1]))
+        self.assertIn("六", self._et_text(split_tables[1]))
+
+    def test_word_postprocess_detects_row_visually_pushed_to_next_page(self):
+        class FakeRangeValues:
+            def __init__(self, start, end):
+                self.Start = start
+                self.End = end
+
+        class FakeRow:
+            def __init__(self, start, end):
+                self.Range = FakeRangeValues(start, end)
+
+        class FakeRows:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def __call__(self, index):
+                return self._rows[index - 1]
+
+        class FakeTable:
+            def __init__(self, rows):
+                self.Rows = FakeRows(rows)
+
+        class FakeRange:
+            def __init__(self, page):
+                self._page = page
+
+            def Information(self, _key):
+                return self._page
+
+        class FakeDoc:
+            def __init__(self, pages):
+                self._pages = pages
+
+            def Range(self, start, _end):
+                return FakeRange(self._pages[start])
+
+        rows = [
+            FakeRow(10, 11),
+            FakeRow(20, 21),
+            FakeRow(30, 31),
+            FakeRow(40, 41),
+            FakeRow(50, 51),
+            FakeRow(60, 61),
+            FakeRow(70, 71),
+        ]
+        pages = {
+            10: 10, 11: 10,
+            20: 10, 21: 10,
+            30: 10, 31: 10,
+            40: 10, 41: 10,
+            50: 10, 51: 10,
+            60: 10, 61: 11,
+            70: 11, 71: 11,
+        }
+
+        breaks = word_postprocess._table_row_page_breaks(
+            FakeDoc(pages),
+            FakeTable(rows),
+            row_count=len(rows),
+            header_count=1,
+        )
+
+        self.assertEqual(breaks, [6])
+
+    def test_word_postprocess_applies_one_plan_before_remeasuring(self):
+        first = word_postprocess._TableContinuationPlan(
+            table_index=1,
+            row_breaks=[4],
+            header_count=1,
+            caption_text="表1　前表（续）",
+        )
+        stale_second = word_postprocess._TableContinuationPlan(
+            table_index=2,
+            row_breaks=[6],
+            header_count=1,
+            caption_text="表2　后表（续）",
+        )
+        fresh_second = word_postprocess._TableContinuationPlan(
+            table_index=3,
+            row_breaks=[5],
+            header_count=1,
+            caption_text="表2　后表（续）",
+        )
+        measured = [[first, stale_second], [fresh_second], []]
+        applied = []
+
+        def fake_measure(_word, _path):
+            return measured.pop(0)
+
+        def fake_apply(_path, plans):
+            applied.append(plans)
+            return True
+
+        with mock.patch("md2std.word_postprocess._measure_table_continuations", fake_measure), \
+             mock.patch("md2std.word_postprocess._apply_table_continuations", fake_apply):
+            word_postprocess._postprocess_document(object(), "dummy.docx")
+
+        self.assertEqual(applied, [[first], [fresh_second]])
+
     def test_cover_blueprints_keep_complete_cover_section(self):
         pairs = [
             (self._first_existing_path(
