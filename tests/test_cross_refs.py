@@ -2599,7 +2599,10 @@ class CoverBackendDocxTest(unittest.TestCase):
             applied.append(plans)
             return True
 
-        with mock.patch("md2std.word_postprocess._measure_table_continuations", fake_measure), \
+        def fake_measure_layout(word, path):
+            return fake_measure(word, path), []
+
+        with mock.patch("md2std.word_postprocess._measure_table_layout_plans", fake_measure_layout), \
              mock.patch("md2std.word_postprocess._apply_table_continuations", fake_apply):
             word_postprocess._postprocess_document(object(), "dummy.docx")
 
@@ -2629,6 +2632,16 @@ class CoverBackendDocxTest(unittest.TestCase):
 
         self.assertEqual(plans, [first, second])
 
+    def test_word_postprocess_detects_self_spanning_rows(self):
+        spans = [
+            (1, 3, 3),
+            (2, 3, 4),
+            (3, 4, 4),
+            (4, 4, 6),
+        ]
+
+        self.assertEqual(word_postprocess._self_spanning_row_indices(spans), [2, 4])
+
     def test_word_postprocess_stops_on_repeated_continuation_plan(self):
         plan = word_postprocess._TableContinuationPlan(
             table_index=1,
@@ -2646,11 +2659,73 @@ class CoverBackendDocxTest(unittest.TestCase):
             applied.append(plans)
             return True
 
-        with mock.patch("md2std.word_postprocess._measure_table_continuations", fake_measure), \
+        def fake_measure_layout(word, path):
+            return fake_measure(word, path), []
+
+        with mock.patch("md2std.word_postprocess._measure_table_layout_plans", fake_measure_layout), \
              mock.patch("md2std.word_postprocess._apply_table_continuations", fake_apply):
             word_postprocess._postprocess_document(object(), "dummy.docx")
 
         self.assertEqual(applied, [[plan]])
+
+    def test_word_postprocess_applies_horizontal_split_when_no_vertical_plan(self):
+        horizontal = word_postprocess._HorizontalTableSplitPlan(
+            table_index=1,
+            caption_text="表1　宽表（续）",
+        )
+        measured = [([], [horizontal]), ([], [])]
+        applied = []
+
+        def fake_measure(_word, _path):
+            return measured.pop(0)
+
+        def fake_horizontal(_path, plans):
+            applied.append(plans)
+            return len(applied) == 1
+
+        with mock.patch("md2std.word_postprocess._measure_table_layout_plans", fake_measure), \
+             mock.patch("md2std.word_postprocess._apply_horizontal_table_splits", fake_horizontal):
+            word_postprocess._postprocess_document(object(), "dummy.docx")
+
+        self.assertEqual(applied, [[horizontal]])
+
+    def test_word_postprocess_splits_wide_table_horizontally(self):
+        sdoc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:wide} 宽表\n\n"
+            "| A | B | C | D | E | F | G | H | I | J |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+            "| a | b | c | d | e | f | g | h | i | j |\n"
+        )
+        fd, path = tempfile.mkstemp(suffix=".docx")
+        os.close(fd)
+        try:
+            docx_builder.build_cover(sdoc, path)
+            changed = word_postprocess._apply_horizontal_table_splits(path, [
+                word_postprocess._HorizontalTableSplitPlan(
+                    table_index=2,
+                    caption_text="表1　宽表（续）",
+                )
+            ])
+            with zipfile.ZipFile(path) as zf:
+                xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+        self.assertTrue(changed)
+        self.assertIn("表1　宽表（续）", xml)
+        root = ET.fromstring(xml)
+        split_tables = [
+            table for table in root.findall(".//w:tbl", self._W_NS)
+            if "A" in self._et_text(table) and ("I" in self._et_text(table) or "J" in self._et_text(table))
+        ]
+        self.assertEqual(len(split_tables), 2)
+        self.assertIn("I", self._et_text(split_tables[0]))
+        self.assertNotIn("J", self._et_text(split_tables[0]))
+        self.assertIn("A", self._et_text(split_tables[1]))
+        self.assertIn("J", self._et_text(split_tables[1]))
+        self.assertNotIn("B", self._et_text(split_tables[1]))
 
     def test_word_postprocess_splits_when_first_segment_has_one_body_row(self):
         sdoc = md_parser.parse(

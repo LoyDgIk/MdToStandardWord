@@ -17,7 +17,7 @@ import tempfile
 import threading
 import zipfile
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple
 
 from lxml import etree as ET
 
@@ -29,6 +29,9 @@ _CONTINUATION_SUFFIX = "（续）"
 _WORD_COM_TIMEOUT_SECONDS = 180
 _MIN_BODY_ROWS_BEFORE_CONTINUATION = 1
 _CAPTION_LOOKBACK_PARAGRAPHS = 6
+_HORIZONTAL_SPLIT_REPEAT_COLUMNS = 1
+_HORIZONTAL_SPLIT_MIN_COLUMNS = 4
+_HORIZONTAL_MIN_READABLE_COLUMN_WIDTH = 1000
 
 
 @dataclass
@@ -38,6 +41,14 @@ class _TableContinuationPlan:
     table_index: int
     row_breaks: List[int]
     header_count: int
+    caption_text: str
+
+
+@dataclass
+class _HorizontalTableSplitPlan:
+    """一个表格的横向拆分计划。列分组由 OOXML 实际宽度计算。"""
+
+    table_index: int
     caption_text: str
 
 
@@ -170,8 +181,10 @@ def _postprocess_document(word, abs_path: str):
     max_iterations = 20
     applied_signatures = set()
     for _ in range(max_iterations):
-        plans = _measure_table_continuations(word, abs_path)
+        plans, horizontal_plans = _measure_table_layout_plans(word, abs_path)
         if not plans:
+            if horizontal_plans and _apply_horizontal_table_splits(abs_path, horizontal_plans):
+                continue
             return
         plan = plans[0]
         signature = _table_continuation_plan_signature(plan)
@@ -183,11 +196,17 @@ def _postprocess_document(word, abs_path: str):
         if not _apply_table_continuations(abs_path, [plan]):
             return
     # 最后一轮保存一次 Word 分页结果；若仍有极端超高行，避免无限循环。
-    _measure_table_continuations(word, abs_path)
+    _measure_table_layout_plans(word, abs_path)
 
 
 def _measure_table_continuations(word, abs_path: str) -> List[_TableContinuationPlan]:
     """让 Word 完成分页后，收集真实跨页表格的断开行。"""
+    plans, _horizontal_plans = _measure_table_layout_plans(word, abs_path)
+    return plans
+
+
+def _measure_table_layout_plans(word, abs_path: str) -> Tuple[List[_TableContinuationPlan], List[_HorizontalTableSplitPlan]]:
+    """让 Word 完成分页后，收集跨页续表和横向拆表所需的真实表题。"""
     doc = None
     try:
         doc = _open_document(word, abs_path)
@@ -197,9 +216,15 @@ def _measure_table_continuations(word, abs_path: str) -> List[_TableContinuation
             doc.Repaginate()
         except Exception:
             pass
+        if _allow_self_spanning_rows(doc):
+            try:
+                doc.Repaginate()
+            except Exception:
+                pass
         plans = _collect_table_continuation_plans(doc)
+        horizontal_plans = _collect_horizontal_table_split_plans(doc)
         doc.Save()
-        return plans
+        return plans, horizontal_plans
     finally:
         if doc is not None:
             try:
@@ -237,6 +262,43 @@ def _disable_row_page_breaks(doc):
             pass
 
 
+def _allow_self_spanning_rows(doc) -> bool:
+    """超高行只能交给 Word 在行内自然分页，不能尝试插入续表题。"""
+    changed = False
+    try:
+        table_count = doc.Tables.Count
+    except Exception:
+        return False
+    for table_index in range(1, table_count + 1):
+        try:
+            table = doc.Tables(table_index)
+            row_count = table.Rows.Count
+        except Exception:
+            continue
+        row_spans = _table_row_page_spans_from_cells(doc, table)
+        if not row_spans:
+            continue
+        for row_index in _self_spanning_row_indices(row_spans):
+            if row_index < 1 or row_index > row_count:
+                continue
+            try:
+                row = table.Rows(row_index)
+                if not bool(row.AllowBreakAcrossPages):
+                    row.AllowBreakAcrossPages = True
+                    changed = True
+            except Exception:
+                continue
+    return changed
+
+
+def _self_spanning_row_indices(row_spans) -> List[int]:
+    return [
+        row_index
+        for row_index, start_page, end_page in row_spans
+        if isinstance(start_page, int) and isinstance(end_page, int) and end_page != start_page
+    ]
+
+
 def _collect_table_continuation_plans(doc) -> List[_TableContinuationPlan]:
     plans: List[_TableContinuationPlan] = []
     try:
@@ -268,6 +330,25 @@ def _collect_table_continuation_plans(doc) -> List[_TableContinuationPlan]:
                 caption_text=_continuation_caption_text(caption_text),
             ))
     return _dedupe_table_continuation_plans(plans)
+
+
+def _collect_horizontal_table_split_plans(doc) -> List[_HorizontalTableSplitPlan]:
+    plans: List[_HorizontalTableSplitPlan] = []
+    try:
+        table_count = doc.Tables.Count
+    except Exception:
+        return plans
+    for table_index in range(1, table_count + 1):
+        try:
+            table = doc.Tables(table_index)
+            caption_text = _table_caption_text(doc, table)
+        except Exception:
+            continue
+        if not _is_table_caption(caption_text):
+            continue
+        caption_text = _continuation_caption_text(caption_text)
+        plans.append(_HorizontalTableSplitPlan(table_index=table_index, caption_text=caption_text))
+    return plans
 
 
 def _table_continuation_plan_signature(plan: _TableContinuationPlan):
@@ -484,6 +565,48 @@ def _apply_table_continuations(path: str, plans: List[_TableContinuationPlan]) -
     return True
 
 
+def _apply_horizontal_table_splits(path: str, plans: List[_HorizontalTableSplitPlan]) -> bool:
+    if not plans:
+        return False
+    with zipfile.ZipFile(path, "r") as zin:
+        document_xml = zin.read("word/document.xml")
+        styles_xml = zin.read("word/styles.xml")
+        entries = [(item, zin.read(item.filename)) for item in zin.infolist()]
+
+    root = ET.fromstring(document_xml)
+    body = root.find(_w("body"))
+    if body is None:
+        return False
+    available_width = _body_available_width_twips(body)
+    if available_width <= 0:
+        return False
+    style_id = _style_id_by_name(styles_xml, _CONTINUATION_STYLE_NAME)
+    changed = _split_tables_horizontally(body, plans, style_id, available_width)
+    if not changed:
+        return False
+
+    new_document_xml = ET.tostring(
+        root,
+        encoding="UTF-8",
+        xml_declaration=True,
+        standalone=True,
+    )
+    fd, tmp_path = tempfile.mkstemp(suffix=".docx")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item, data in entries:
+                if item.filename == "word/document.xml":
+                    zout.writestr(item, new_document_xml)
+                else:
+                    zout.writestr(item, data)
+        shutil.move(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    return True
+
+
 def _split_tables_for_continuations(body, plans: List[_TableContinuationPlan], style_id: str) -> bool:
     tables = [el for el in list(body) if el.tag == _w("tbl")]
     changed = False
@@ -500,6 +623,101 @@ def _split_tables_for_continuations(body, plans: List[_TableContinuationPlan], s
             body.insert(pos + offset, element)
         changed = True
     return changed
+
+
+def _split_tables_horizontally(body, plans: List[_HorizontalTableSplitPlan],
+                               style_id: str, available_width: int) -> bool:
+    tables = [el for el in list(body) if el.tag == _w("tbl")]
+    plan_by_index = {plan.table_index: plan for plan in plans}
+    changed = False
+    for table_index in range(len(tables), 0, -1):
+        plan = plan_by_index.get(table_index)
+        if plan is None:
+            continue
+        table = tables[table_index - 1]
+        replacement = _split_table_horizontally(table, plan, style_id, available_width)
+        if not replacement:
+            continue
+        pos = list(body).index(table)
+        body.remove(table)
+        for offset, element in enumerate(replacement):
+            body.insert(pos + offset, element)
+        changed = True
+    return changed
+
+
+def _split_table_horizontally(table, plan: _HorizontalTableSplitPlan,
+                              style_id: str, available_width: int) -> List[ET.Element]:
+    widths = _table_grid_widths(table)
+    if len(widths) < _HORIZONTAL_SPLIT_MIN_COLUMNS:
+        return []
+    grouping_widths = _horizontal_grouping_widths(widths, available_width)
+    if sum(widths) <= available_width and grouping_widths == widths:
+        return []
+    if _table_has_unsupported_horizontal_spans(table, len(widths)):
+        return []
+    groups = _horizontal_column_groups(grouping_widths, available_width)
+    if len(groups) <= 1:
+        return []
+
+    trailing_full_span_start = _trailing_full_span_row_start(table, len(widths))
+    elements: List[ET.Element] = []
+    for segment_index, columns in enumerate(groups):
+        is_last_segment = segment_index == len(groups) - 1
+        if segment_index > 0:
+            elements.append(_make_continuation_caption(table, plan.caption_text, style_id))
+        elements.append(_make_table_with_columns(
+            table,
+            columns,
+            [grouping_widths[i] for i in columns],
+            trailing_full_span_start=trailing_full_span_start,
+            include_trailing_full_span=is_last_segment,
+        ))
+    return elements
+
+
+def _horizontal_grouping_widths(widths: Sequence[int], available_width: int) -> List[int]:
+    widths = list(widths)
+    if not widths or available_width <= 0:
+        return widths
+    if sum(widths) > available_width:
+        return widths
+    readable_widths = [max(width, _HORIZONTAL_MIN_READABLE_COLUMN_WIDTH) for width in widths]
+    if sum(readable_widths) <= available_width:
+        return widths
+    return readable_widths
+
+
+def _horizontal_column_groups(widths: Sequence[int], available_width: int) -> List[List[int]]:
+    if not widths or available_width <= 0:
+        return []
+    groups: List[List[int]] = []
+    repeat = min(_HORIZONTAL_SPLIT_REPEAT_COLUMNS, max(0, len(widths) - 1))
+    start = 0
+    while start < len(widths):
+        columns: List[int] = []
+        width = 0
+        if groups and repeat:
+            columns.extend(range(repeat))
+            width = sum(widths[:repeat])
+        added = False
+        while start < len(widths):
+            if start in columns:
+                start += 1
+                continue
+            next_width = widths[start]
+            if added and width + next_width > available_width:
+                break
+            columns.append(start)
+            width += next_width
+            start += 1
+            added = True
+            if width >= available_width:
+                break
+        if not added:
+            return []
+        groups.append(columns)
+    return groups
 
 
 def _split_table_element(table, plan: _TableContinuationPlan, style_id: str) -> List[ET.Element]:
@@ -535,6 +753,166 @@ def _split_table_element(table, plan: _TableContinuationPlan, style_id: str) -> 
             elements.append(_make_continuation_caption(table, plan.caption_text, style_id))
         elements.append(_make_table_with_rows(table, segment_rows))
     return elements if len(elements) > 1 else []
+
+
+def _body_available_width_twips(body) -> int:
+    sect_pr = body.find(_w("sectPr"))
+    if sect_pr is None:
+        return 0
+    pg_sz = sect_pr.find(_w("pgSz"))
+    pg_mar = sect_pr.find(_w("pgMar"))
+    if pg_sz is None or pg_mar is None:
+        return 0
+    page_width = _int_attr(pg_sz, _w("w"), 0)
+    left = _int_attr(pg_mar, _w("left"), 0)
+    right = _int_attr(pg_mar, _w("right"), 0)
+    gutter = _int_attr(pg_mar, _w("gutter"), 0)
+    return page_width - left - right - gutter
+
+
+def _table_grid_widths(table) -> List[int]:
+    grid = table.find(_w("tblGrid"))
+    if grid is None:
+        return []
+    widths: List[int] = []
+    for col in grid.findall(_w("gridCol")):
+        width = _int_attr(col, _w("w"), 0)
+        if width <= 0:
+            return []
+        widths.append(width)
+    return widths
+
+
+def _table_has_unsupported_horizontal_spans(table, column_count: int) -> bool:
+    for row in table.findall(_w("tr")):
+        cells = row.findall(_w("tc"))
+        if _row_is_full_width_span(row, column_count):
+            continue
+        col_pos = 0
+        for cell in cells:
+            if cell.find("./" + _w("tcPr") + "/" + _w("vMerge")) is not None:
+                return True
+            if cell.find("./" + _w("tcPr") + "/" + _w("hMerge")) is not None:
+                return True
+            span = _grid_span(cell)
+            if span != 1:
+                return True
+            col_pos += span
+        if col_pos != column_count:
+            return True
+    return False
+
+
+def _trailing_full_span_row_start(table, column_count: int) -> int:
+    rows = table.findall(_w("tr"))
+    index = len(rows)
+    while index > 0 and _row_is_full_width_span(rows[index - 1], column_count):
+        index -= 1
+    return index
+
+
+def _row_is_full_width_span(row, column_count: int) -> bool:
+    cells = row.findall(_w("tc"))
+    return len(cells) == 1 and _grid_span(cells[0]) == column_count
+
+
+def _grid_span(cell) -> int:
+    span = cell.find("./" + _w("tcPr") + "/" + _w("gridSpan"))
+    if span is None:
+        return 1
+    return _int_attr(span, _w("val"), 1)
+
+
+def _make_table_with_columns(source_table, columns: Sequence[int], widths: Sequence[int],
+                             trailing_full_span_start: int,
+                             include_trailing_full_span: bool):
+    new_table = ET.Element(source_table.tag, source_table.attrib)
+    table_width = sum(widths)
+    for child in list(source_table):
+        if child.tag == _w("tr"):
+            continue
+        if child.tag == _w("tblGrid"):
+            new_table.append(_make_table_grid(widths))
+            continue
+        copied = copy.deepcopy(child)
+        if copied.tag == _w("tblPr"):
+            _set_table_property_width(copied, table_width)
+        new_table.append(copied)
+    for row_index, row in enumerate(source_table.findall(_w("tr"))):
+        full_span = _row_is_full_width_span(row, len(_table_grid_widths(source_table)))
+        if full_span and row_index >= trailing_full_span_start and not include_trailing_full_span:
+            continue
+        new_table.append(_make_row_with_columns(row, columns, widths, table_width, full_span))
+    return new_table
+
+
+def _make_table_grid(widths: Sequence[int]):
+    grid = ET.Element(_w("tblGrid"))
+    for width in widths:
+        col = ET.SubElement(grid, _w("gridCol"))
+        col.set(_w("w"), str(width))
+    return grid
+
+
+def _set_table_property_width(tbl_pr, width: int):
+    tbl_w = tbl_pr.find(_w("tblW"))
+    if tbl_w is None:
+        tbl_w = ET.Element(_w("tblW"))
+        tbl_pr.insert(0, tbl_w)
+    tbl_w.set(_w("type"), "dxa")
+    tbl_w.set(_w("w"), str(width))
+
+
+def _make_row_with_columns(row, columns: Sequence[int], widths: Sequence[int],
+                           table_width: int, full_span: bool):
+    new_row = ET.Element(row.tag, row.attrib)
+    for child in list(row):
+        if child.tag == _w("tc"):
+            continue
+        new_row.append(copy.deepcopy(child))
+    cells = row.findall(_w("tc"))
+    if full_span and cells:
+        cell = copy.deepcopy(cells[0])
+        _set_cell_grid_span(cell, len(columns))
+        _set_cell_width_twips(cell, table_width)
+        new_row.append(cell)
+        return new_row
+    for group_index, column_index in enumerate(columns):
+        if column_index >= len(cells):
+            continue
+        cell = copy.deepcopy(cells[column_index])
+        _set_cell_width_twips(cell, widths[group_index])
+        new_row.append(cell)
+    return new_row
+
+
+def _set_cell_grid_span(cell, span: int):
+    tc_pr = cell.find(_w("tcPr"))
+    if tc_pr is None:
+        tc_pr = ET.Element(_w("tcPr"))
+        cell.insert(0, tc_pr)
+    grid_span = tc_pr.find(_w("gridSpan"))
+    if span <= 1:
+        if grid_span is not None:
+            tc_pr.remove(grid_span)
+        return
+    if grid_span is None:
+        grid_span = ET.Element(_w("gridSpan"))
+        tc_pr.append(grid_span)
+    grid_span.set(_w("val"), str(span))
+
+
+def _set_cell_width_twips(cell, width: int):
+    tc_pr = cell.find(_w("tcPr"))
+    if tc_pr is None:
+        tc_pr = ET.Element(_w("tcPr"))
+        cell.insert(0, tc_pr)
+    tc_w = tc_pr.find(_w("tcW"))
+    if tc_w is None:
+        tc_w = ET.Element(_w("tcW"))
+        tc_pr.insert(0, tc_w)
+    tc_w.set(_w("type"), "dxa")
+    tc_w.set(_w("w"), str(width))
 
 
 def _valid_continuation_breaks(row_breaks: List[int], header_count: int,
@@ -618,6 +996,13 @@ def _style_id_by_name(styles_xml: bytes, style_name: str) -> str:
 
 def _w(tag: str) -> str:
     return "{%s}%s" % (_W_NS, tag)
+
+
+def _int_attr(element, name: str, default: int = 0) -> int:
+    try:
+        return int(element.get(name, default))
+    except (TypeError, ValueError):
+        return default
 
 
 def _update_all_fields(doc):
