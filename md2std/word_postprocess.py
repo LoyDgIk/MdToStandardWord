@@ -28,6 +28,7 @@ _CONTINUATION_STYLE_NAME = "标准文件_表格续"
 _CONTINUATION_SUFFIX = "（续）"
 _WORD_COM_TIMEOUT_SECONDS = 180
 _MIN_BODY_ROWS_BEFORE_CONTINUATION = 1
+_MIN_BODY_ROWS_AFTER_CONTINUATION = 1
 _CAPTION_LOOKBACK_PARAGRAPHS = 6
 _HORIZONTAL_SPLIT_REPEAT_COLUMNS = 1
 _HORIZONTAL_SPLIT_MIN_COLUMNS = 4
@@ -188,15 +189,20 @@ def _postprocess_document(word, abs_path: str):
             if horizontal_plans and _apply_horizontal_table_splits(abs_path, horizontal_plans):
                 continue
             return
-        plan = plans[0]
-        signature = _table_continuation_plan_signature(plan)
-        if signature in applied_signatures:
+        unapplied = [plan for plan in plans if _table_continuation_plan_signature(plan) not in applied_signatures]
+        if not unapplied:
             return
-        applied_signatures.add(signature)
         # 续表题与后续表格保持同页，拆表仍可能改变后续表的分页位置。
-        # 因此每轮只处理文档中最早的一个计划，随后交给 Word 重新分页。
-        if not _apply_table_continuations(abs_path, [plan]):
-            return
+        # 因此每轮只实际处理文档中最早的一个可应用计划，随后交给 Word 重新分页。
+        applied = False
+        for plan in unapplied:
+            signature = _table_continuation_plan_signature(plan)
+            applied_signatures.add(signature)
+            if _apply_table_continuations(abs_path, [plan]):
+                applied = True
+                break
+        if not applied:
+            continue
     # 最后一轮保存一次 Word 分页结果；若仍有极端超高行，避免无限循环。
     _measure_table_layout_plans(word, abs_path)
 
@@ -528,6 +534,43 @@ def _has_enough_body_rows_before_break(row_index: int, header_count: int,
     return row_index - segment_start >= _MIN_BODY_ROWS_BEFORE_CONTINUATION
 
 
+def _has_enough_body_rows_after_break(rows: List[ET.Element], row_index: int,
+                                      header_count: int) -> bool:
+    body_rows = [
+        row for row in rows[row_index - 1:]
+        if not _row_is_header(row) and not _is_table_tail_note_row(row)
+    ]
+    return len(body_rows) >= _MIN_BODY_ROWS_AFTER_CONTINUATION
+
+
+def _row_is_header(row: ET.Element) -> bool:
+    header = row.find("./" + _w("trPr") + "/" + _w("tblHeader"))
+    if header is None:
+        return False
+    value = header.get(_w("val"))
+    return value not in ("0", "false", "False")
+
+
+def _is_table_tail_note_row(row: ET.Element) -> bool:
+    cells = row.findall(_w("tc"))
+    if not cells:
+        return False
+    text = _row_text(row)
+    if not text:
+        return False
+    if re.match(r"^(?:注|注\d+|来源|说明|备注)[：:]", text) is None:
+        return False
+    filled_cells = [
+        cell for cell in cells
+        if "".join((node.text or "") for node in cell.findall(".//" + _w("t"))).strip()
+    ]
+    return len(cells) == 1 or len(filled_cells) == 1
+
+
+def _row_text(row: ET.Element) -> str:
+    return "".join((node.text or "") for node in row.findall(".//" + _w("t"))).strip()
+
+
 def _apply_table_continuations(path: str, plans: List[_TableContinuationPlan]) -> bool:
     if not plans:
         return False
@@ -732,6 +775,7 @@ def _split_table_element(table, plan: _TableContinuationPlan, style_id: str) -> 
         _safe_vmerge_breaks(rows, plan.row_breaks),
         plan.header_count,
         len(rows),
+        rows,
     )
     if not valid_breaks:
         return []
@@ -752,9 +796,25 @@ def _split_table_element(table, plan: _TableContinuationPlan, style_id: str) -> 
         if segment_index > 0 and header_rows:
             segment_rows = header_rows + segment_rows
         if segment_index > 0:
+            segment_rows = _restart_leading_vmerge(segment_rows, len(header_rows))
             elements.append(_make_continuation_caption(table, plan.caption_text, style_id))
         elements.append(_make_table_with_rows(table, segment_rows))
     return elements if len(elements) > 1 else []
+
+
+def _restart_leading_vmerge(rows: List[ET.Element], header_count: int) -> List[ET.Element]:
+    copied_rows = [copy.deepcopy(row) for row in rows]
+    if header_count >= len(copied_rows):
+        return copied_rows
+    first_body = copied_rows[header_count]
+    for cell in first_body.findall(_w("tc")):
+        vmerge = cell.find("./" + _w("tcPr") + "/" + _w("vMerge"))
+        if vmerge is None:
+            continue
+        value = vmerge.get(_w("val"))
+        if value in (None, "", "continue"):
+            vmerge.set(_w("val"), "restart")
+    return copied_rows
 
 
 def _body_available_width_twips(body) -> int:
@@ -918,7 +978,8 @@ def _set_cell_width_twips(cell, width: int):
 
 
 def _valid_continuation_breaks(row_breaks: List[int], header_count: int,
-                               row_count: int) -> List[int]:
+                               row_count: int,
+                               rows: Optional[List[ET.Element]] = None) -> List[int]:
     valid_breaks: List[int] = []
     previous_break: Optional[int] = None
     for br in sorted(set(row_breaks)):
@@ -926,21 +987,16 @@ def _valid_continuation_breaks(row_breaks: List[int], header_count: int,
             continue
         if not _has_enough_body_rows_before_break(br, header_count, previous_break):
             continue
+        if rows is not None and not _has_enough_body_rows_after_break(rows, br, header_count):
+            continue
         valid_breaks.append(br)
         previous_break = br
     return valid_breaks
 
 
 def _safe_vmerge_breaks(rows: List[ET.Element], row_breaks: List[int]) -> List[int]:
-    safe_breaks: List[int] = []
     row_count = len(rows)
-    for br in row_breaks:
-        safe = br
-        while safe <= row_count and _row_has_vmerge_continue(rows[safe - 1]):
-            safe += 1
-        if safe <= row_count:
-            safe_breaks.append(safe)
-    return safe_breaks
+    return [br for br in row_breaks if 1 <= br <= row_count]
 
 
 def _row_has_vmerge_continue(row: ET.Element) -> bool:

@@ -2628,7 +2628,7 @@ class CoverBackendDocxTest(unittest.TestCase):
 
         self.assertEqual(breaks, [3])
 
-    def test_word_postprocess_moves_break_after_vmerge_continuation(self):
+    def test_word_postprocess_keeps_measured_vmerge_breaks(self):
         rows = [
             ET.fromstring("<w:tr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:tc/></w:tr>"),
             ET.fromstring("<w:tr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:tc><w:tcPr><w:vMerge w:val=\"restart\"/></w:tcPr></w:tc></w:tr>"),
@@ -2636,7 +2636,25 @@ class CoverBackendDocxTest(unittest.TestCase):
             ET.fromstring("<w:tr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:tc/></w:tr>"),
         ]
 
-        self.assertEqual(word_postprocess._safe_vmerge_breaks(rows, [3]), [4])
+        self.assertEqual(word_postprocess._safe_vmerge_breaks(rows, [3]), [3])
+
+    def test_word_postprocess_restarts_leading_vmerge_after_split(self):
+        rows = [
+            ET.fromstring("<w:tr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:tc/></w:tr>"),
+            ET.fromstring("<w:tr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:tc><w:tcPr><w:vMerge w:val=\"restart\"/></w:tcPr><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr>"),
+            ET.fromstring("<w:tr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:tc><w:tcPr><w:vMerge/></w:tcPr></w:tc></w:tr>"),
+            ET.fromstring("<w:tr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:tc><w:tcPr><w:vMerge w:val=\"restart\"/></w:tcPr><w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc></w:tr>"),
+            ET.fromstring("<w:tr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:tc><w:tcPr><w:vMerge/></w:tcPr></w:tc></w:tr>"),
+            ET.fromstring("<w:tr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:tc><w:p><w:r><w:t>来源：说明。</w:t></w:r></w:p></w:tc></w:tr>"),
+        ]
+
+        self.assertEqual(
+            word_postprocess._valid_continuation_breaks([5, 6], 1, len(rows), rows),
+            [5],
+        )
+        restarted = word_postprocess._restart_leading_vmerge([rows[0], rows[4], rows[5]], 1)
+        vmerge = restarted[1].find(".//w:vMerge", self._W_NS)
+        self.assertEqual(vmerge.get(self._w_tag("val")), "restart")
 
     def test_word_postprocess_applies_one_plan_before_remeasuring(self):
         first = word_postprocess._TableContinuationPlan(
@@ -2735,6 +2753,35 @@ class CoverBackendDocxTest(unittest.TestCase):
             word_postprocess._postprocess_document(object(), "dummy.docx")
 
         self.assertEqual(applied, [[plan]])
+
+    def test_word_postprocess_continues_after_unapplied_plan(self):
+        first = word_postprocess._TableContinuationPlan(
+            table_index=1,
+            row_breaks=[7],
+            header_count=1,
+            caption_text="表1　前表（续）",
+        )
+        second = word_postprocess._TableContinuationPlan(
+            table_index=2,
+            row_breaks=[7],
+            header_count=1,
+            caption_text="表2　后表（续）",
+        )
+        measured = [[first, second], [second], []]
+        applied = []
+
+        def fake_measure_layout(_word, _path):
+            return measured.pop(0), []
+
+        def fake_apply(_path, plans):
+            applied.append(plans)
+            return plans[0] is second
+
+        with mock.patch("md2std.word_postprocess._measure_table_layout_plans", fake_measure_layout), \
+             mock.patch("md2std.word_postprocess._apply_table_continuations", fake_apply):
+            word_postprocess._postprocess_document(object(), "dummy.docx")
+
+        self.assertEqual(applied, [[first], [second]])
 
     def test_word_postprocess_applies_horizontal_split_when_no_vertical_plan(self):
         horizontal = word_postprocess._HorizontalTableSplitPlan(
@@ -2858,6 +2905,39 @@ class CoverBackendDocxTest(unittest.TestCase):
         self.assertTrue(changed)
         self.assertIn("表1　测试表（续）", xml)
         self.assertEqual(xml.count("唯一表头"), 2)
+
+    def test_word_postprocess_does_not_split_tail_note_only_segment(self):
+        sdoc = md_parser.parse(
+            "# 范围\n\n"
+            "{表：#tbl:split} 测试表\n\n"
+            "| 唯一表头 | 值 |\n"
+            "| --- | --- |\n"
+            "| 一 | 1 |\n"
+            "| 二 | 2 |\n"
+            "| 三 | 3 |\n"
+            "| 注：这是表尾说明。 ||\n"
+        )
+        fd, path = tempfile.mkstemp(suffix=".docx")
+        os.close(fd)
+        try:
+            docx_builder.build_cover(sdoc, path)
+            changed = word_postprocess._apply_table_continuations(path, [
+                word_postprocess._TableContinuationPlan(
+                    table_index=2,
+                    row_breaks=[5],
+                    header_count=1,
+                    caption_text="表1　测试表（续）",
+                )
+            ])
+            with zipfile.ZipFile(path) as zf:
+                xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+        self.assertFalse(changed)
+        self.assertNotIn("表1　测试表（续）", xml)
+        self.assertEqual(xml.count("唯一表头"), 1)
 
     def test_word_postprocess_keeps_measured_break_for_short_tail(self):
         sdoc = md_parser.parse(
