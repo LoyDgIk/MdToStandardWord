@@ -2383,7 +2383,8 @@ class CoverBackendDocxTest(unittest.TestCase):
         self.assertEqual(len(root.findall(".//w:tblHeader", self._W_NS)), 2)
         continuation = self._et_paragraph_containing(root, "表1　测试表（续）")
         self.assertIsNotNone(continuation)
-        self.assertIsNotNone(continuation.find("w:pPr/w:pageBreakBefore", self._W_NS))
+        self.assertIsNone(continuation.find("w:pPr/w:pageBreakBefore", self._W_NS))
+        self.assertIsNotNone(continuation.find("w:pPr/w:keepNext", self._W_NS))
 
     def test_word_postprocess_applies_only_first_measured_break_per_iteration(self):
         sdoc = md_parser.parse(
@@ -2493,6 +2494,82 @@ class CoverBackendDocxTest(unittest.TestCase):
 
         self.assertEqual(breaks, [6])
 
+    def test_word_postprocess_detects_vertical_merge_table_breaks_from_cells(self):
+        class FakeRangeValues:
+            def __init__(self, start, end):
+                self.Start = start
+                self.End = end
+
+        class FakeRows:
+            def __call__(self, _index):
+                raise RuntimeError("vertical merge")
+
+        class FakeCell:
+            def __init__(self, row_index, start, end):
+                self.RowIndex = row_index
+                self.Range = FakeRangeValues(start, end)
+
+        class FakeCells:
+            def __init__(self, cells):
+                self._cells = cells
+                self.Count = len(cells)
+
+            def Item(self, index):
+                return self._cells[index - 1]
+
+        class FakeRange:
+            def __init__(self, page=None, cells=None):
+                self._page = page
+                self.Cells = cells
+
+            def Information(self, _key):
+                return self._page
+
+        class FakeTable:
+            def __init__(self, cells):
+                self.Rows = FakeRows()
+                self.Range = FakeRange(cells=FakeCells(cells))
+
+        class FakeDoc:
+            def __init__(self, pages):
+                self._pages = pages
+
+            def Range(self, start, _end):
+                return FakeRange(page=self._pages[start])
+
+        cells = [
+            FakeCell(1, 10, 11),
+            FakeCell(1, 12, 13),
+            FakeCell(2, 20, 21),
+            FakeCell(2, 22, 23),
+            FakeCell(3, 30, 31),
+            FakeCell(3, 32, 33),
+        ]
+        pages = {
+            10: 1, 11: 1, 12: 1, 13: 1,
+            20: 1, 21: 1, 22: 1, 23: 1,
+            30: 2, 31: 2, 32: 2, 33: 2,
+        }
+
+        breaks = word_postprocess._table_row_page_breaks(
+            FakeDoc(pages),
+            FakeTable(cells),
+            row_count=3,
+            header_count=1,
+        )
+
+        self.assertEqual(breaks, [3])
+
+    def test_word_postprocess_moves_break_after_vmerge_continuation(self):
+        rows = [
+            ET.fromstring("<w:tr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:tc/></w:tr>"),
+            ET.fromstring("<w:tr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:tc><w:tcPr><w:vMerge w:val=\"restart\"/></w:tcPr></w:tc></w:tr>"),
+            ET.fromstring("<w:tr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:tc><w:tcPr><w:vMerge/></w:tcPr></w:tc></w:tr>"),
+            ET.fromstring("<w:tr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:tc/></w:tr>"),
+        ]
+
+        self.assertEqual(word_postprocess._safe_vmerge_breaks(rows, [3]), [4])
+
     def test_word_postprocess_applies_one_plan_before_remeasuring(self):
         first = word_postprocess._TableContinuationPlan(
             table_index=1,
@@ -2528,7 +2605,54 @@ class CoverBackendDocxTest(unittest.TestCase):
 
         self.assertEqual(applied, [[first], [fresh_second]])
 
-    def test_word_postprocess_does_not_split_when_first_segment_has_one_body_row(self):
+    def test_word_postprocess_dedupes_identical_continuation_plans(self):
+        first = word_postprocess._TableContinuationPlan(
+            table_index=1,
+            row_breaks=[4],
+            header_count=1,
+            caption_text="表1　前表（续）",
+        )
+        duplicate = word_postprocess._TableContinuationPlan(
+            table_index=1,
+            row_breaks=[4],
+            header_count=1,
+            caption_text="表1　前表（续）",
+        )
+        second = word_postprocess._TableContinuationPlan(
+            table_index=2,
+            row_breaks=[6],
+            header_count=1,
+            caption_text="表2　后表（续）",
+        )
+
+        plans = word_postprocess._dedupe_table_continuation_plans([first, duplicate, second])
+
+        self.assertEqual(plans, [first, second])
+
+    def test_word_postprocess_stops_on_repeated_continuation_plan(self):
+        plan = word_postprocess._TableContinuationPlan(
+            table_index=1,
+            row_breaks=[4],
+            header_count=1,
+            caption_text="表1　测试表（续）",
+        )
+        measured = [[plan], [plan]]
+        applied = []
+
+        def fake_measure(_word, _path):
+            return measured.pop(0)
+
+        def fake_apply(_path, plans):
+            applied.append(plans)
+            return True
+
+        with mock.patch("md2std.word_postprocess._measure_table_continuations", fake_measure), \
+             mock.patch("md2std.word_postprocess._apply_table_continuations", fake_apply):
+            word_postprocess._postprocess_document(object(), "dummy.docx")
+
+        self.assertEqual(applied, [[plan]])
+
+    def test_word_postprocess_splits_when_first_segment_has_one_body_row(self):
         sdoc = md_parser.parse(
             "# 范围\n\n"
             "{表：#tbl:split} 测试表\n\n"
@@ -2556,11 +2680,11 @@ class CoverBackendDocxTest(unittest.TestCase):
             if os.path.exists(path):
                 os.remove(path)
 
-        self.assertFalse(changed)
-        self.assertNotIn("表1　测试表（续）", xml)
-        self.assertEqual(xml.count("唯一表头"), 1)
+        self.assertTrue(changed)
+        self.assertIn("表1　测试表（续）", xml)
+        self.assertEqual(xml.count("唯一表头"), 2)
 
-    def test_word_postprocess_does_not_split_when_tail_segment_has_one_body_row(self):
+    def test_word_postprocess_splits_when_tail_segment_has_one_body_row(self):
         sdoc = md_parser.parse(
             "# 范围\n\n"
             "{表：#tbl:split} 测试表\n\n"
@@ -2588,11 +2712,11 @@ class CoverBackendDocxTest(unittest.TestCase):
             if os.path.exists(path):
                 os.remove(path)
 
-        self.assertFalse(changed)
-        self.assertNotIn("表1　测试表（续）", xml)
-        self.assertEqual(xml.count("唯一表头"), 1)
+        self.assertTrue(changed)
+        self.assertIn("表1　测试表（续）", xml)
+        self.assertEqual(xml.count("唯一表头"), 2)
 
-    def test_word_postprocess_balances_short_tail_by_moving_previous_row_to_continuation(self):
+    def test_word_postprocess_keeps_measured_break_for_short_tail(self):
         sdoc = md_parser.parse(
             "# 范围\n\n"
             "{表：#tbl:split} 测试表\n\n"
@@ -2627,15 +2751,15 @@ class CoverBackendDocxTest(unittest.TestCase):
         self.assertEqual(xml.count("唯一表头"), 2)
         root = ET.fromstring(xml)
         continuation = self._et_paragraph_containing(root, "表1　测试表（续）")
-        self.assertIsNotNone(continuation.find("w:pPr/w:pageBreakBefore", self._W_NS))
+        self.assertIsNone(continuation.find("w:pPr/w:pageBreakBefore", self._W_NS))
+        self.assertIsNotNone(continuation.find("w:pPr/w:keepNext", self._W_NS))
         split_tables = [
             table for table in root.findall(".//w:tbl", self._W_NS)
             if "唯一表头" in self._et_text(table)
         ]
         self.assertEqual(len(split_tables), 2)
-        self.assertIn("三", self._et_text(split_tables[0]))
-        self.assertNotIn("四", self._et_text(split_tables[0]))
-        self.assertIn("四", self._et_text(split_tables[1]))
+        self.assertIn("四", self._et_text(split_tables[0]))
+        self.assertNotIn("五", self._et_text(split_tables[0]))
         self.assertIn("五", self._et_text(split_tables[1]))
 
     def test_cover_blueprints_keep_complete_cover_section(self):

@@ -27,7 +27,8 @@ _WD_ACTIVE_END_PAGE_NUMBER = 3
 _CONTINUATION_STYLE_NAME = "标准文件_表格续"
 _CONTINUATION_SUFFIX = "（续）"
 _WORD_COM_TIMEOUT_SECONDS = 180
-_MIN_BODY_ROWS_BEFORE_CONTINUATION = 2
+_MIN_BODY_ROWS_BEFORE_CONTINUATION = 1
+_CAPTION_LOOKBACK_PARAGRAPHS = 6
 
 
 @dataclass
@@ -167,13 +168,19 @@ def _quit_word(word):
 def _postprocess_document(word, abs_path: str):
     """多轮后处理：测量真实分页 -> 拆续表 -> 重新分页，直到不再需要拆分。"""
     max_iterations = 20
+    applied_signatures = set()
     for _ in range(max_iterations):
         plans = _measure_table_continuations(word, abs_path)
         if not plans:
             return
-        # 插入续表题会强制新页，可能改变后续所有表的分页位置。
+        plan = plans[0]
+        signature = _table_continuation_plan_signature(plan)
+        if signature in applied_signatures:
+            return
+        applied_signatures.add(signature)
+        # 续表题与后续表格保持同页，拆表仍可能改变后续表的分页位置。
         # 因此每轮只处理文档中最早的一个计划，随后交给 Word 重新分页。
-        if not _apply_table_continuations(abs_path, plans[:1]):
+        if not _apply_table_continuations(abs_path, [plan]):
             return
     # 最后一轮保存一次 Word 分页结果；若仍有极端超高行，避免无限循环。
     _measure_table_continuations(word, abs_path)
@@ -260,20 +267,51 @@ def _collect_table_continuation_plans(doc) -> List[_TableContinuationPlan]:
                 header_count=header_count,
                 caption_text=_continuation_caption_text(caption_text),
             ))
-    return plans
+    return _dedupe_table_continuation_plans(plans)
+
+
+def _table_continuation_plan_signature(plan: _TableContinuationPlan):
+    return (
+        plan.table_index,
+        tuple(plan.row_breaks),
+        plan.header_count,
+        plan.caption_text,
+    )
+
+
+def _dedupe_table_continuation_plans(plans: List[_TableContinuationPlan]) -> List[_TableContinuationPlan]:
+    deduped: List[_TableContinuationPlan] = []
+    seen = set()
+    for plan in plans:
+        signature = _table_continuation_plan_signature(plan)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(plan)
+    return deduped
 
 
 def _table_caption_text(doc, table) -> str:
     before = doc.Range(0, table.Range.Start)
-    para = before.Paragraphs.Last
-    text = _clean_word_text(para.Range.Text)
     try:
-        list_string = _clean_word_text(para.Range.ListFormat.ListString)
+        para_count = before.Paragraphs.Count
     except Exception:
-        list_string = ""
-    if list_string:
-        return (list_string + "　" + text).strip()
-    return text
+        para_count = 0
+    fallback = ""
+    for offset in range(0, min(_CAPTION_LOOKBACK_PARAGRAPHS, para_count)):
+        try:
+            para = before.Paragraphs.Item(para_count - offset)
+            text = _clean_word_text(para.Range.Text)
+            list_string = _clean_word_text(para.Range.ListFormat.ListString)
+        except Exception:
+            continue
+        candidate = ((list_string + "　") if list_string else "") + text
+        candidate = candidate.strip()
+        if offset == 0:
+            fallback = candidate
+        if _is_table_caption(candidate):
+            return candidate
+    return fallback
 
 
 def _clean_word_text(text: str) -> str:
@@ -292,29 +330,44 @@ def _continuation_caption_text(text: str) -> str:
 
 def _table_header_count(table, row_count: int) -> int:
     count = 0
+    row_access_failed = False
     for row_index in range(1, row_count + 1):
         try:
             is_header = bool(table.Rows(row_index).HeadingFormat)
         except Exception:
+            row_access_failed = True
             break
         if not is_header:
             break
         count += 1
+    if row_access_failed and count == 0:
+        return _table_header_count_from_openxml(table)
     return count
 
 
 def _table_row_page_breaks(doc, table, row_count: int, header_count: int) -> List[int]:
-    breaks: List[int] = []
-    previous_page = None
+    row_spans = _table_row_page_spans_from_cells(doc, table)
+    if row_spans:
+        return _row_page_breaks(row_spans, header_count)
+    row_spans = []
     for row_index in range(1, row_count + 1):
         try:
             row = table.Rows(row_index)
             start_page = doc.Range(row.Range.Start, row.Range.Start).Information(_WD_ACTIVE_END_PAGE_NUMBER)
             end_page = doc.Range(row.Range.End, row.Range.End).Information(_WD_ACTIVE_END_PAGE_NUMBER)
         except Exception:
-            continue
+            row_spans = _table_row_page_spans_from_cells(doc, table)
+            break
         if not isinstance(start_page, int) or not isinstance(end_page, int):
             continue
+        row_spans.append((row_index, start_page, end_page))
+    return _row_page_breaks(row_spans, header_count)
+
+
+def _row_page_breaks(row_spans, header_count: int) -> List[int]:
+    breaks: List[int] = []
+    previous_page = None
+    for row_index, start_page, end_page in row_spans:
         if previous_page is not None and (start_page != previous_page or end_page != start_page):
             # Word 有时把整行视觉上推到下一页，但 row.Range.Start 仍报告上一页；
             # 此时用 End 页码把断点前移到真实换页行。
@@ -322,6 +375,67 @@ def _table_row_page_breaks(doc, table, row_count: int, header_count: int) -> Lis
                 breaks.append(row_index)
         previous_page = end_page
     return breaks
+
+
+def _table_row_page_spans_from_cells(doc, table):
+    """Fallback for tables with vertical merges where Word disallows Rows(i)."""
+    row_ranges = {}
+    try:
+        cells = table.Range.Cells
+        count = cells.Count
+    except Exception:
+        return []
+    for cell_index in range(1, count + 1):
+        try:
+            cell = cells.Item(cell_index)
+            row_index = int(cell.RowIndex)
+            start = int(cell.Range.Start)
+            end = int(cell.Range.End)
+        except Exception:
+            continue
+        if row_index not in row_ranges:
+            row_ranges[row_index] = [start, end]
+        else:
+            row_ranges[row_index][0] = min(row_ranges[row_index][0], start)
+            row_ranges[row_index][1] = max(row_ranges[row_index][1], end)
+
+    row_spans = []
+    for row_index in sorted(row_ranges):
+        start, end = row_ranges[row_index]
+        try:
+            start_page = doc.Range(start, start).Information(_WD_ACTIVE_END_PAGE_NUMBER)
+            end_page = doc.Range(end, end).Information(_WD_ACTIVE_END_PAGE_NUMBER)
+        except Exception:
+            continue
+        if isinstance(start_page, int) and isinstance(end_page, int):
+            row_spans.append((row_index, start_page, end_page))
+    return row_spans
+
+
+def _table_header_count_from_openxml(table) -> int:
+    try:
+        xml = table.Range.WordOpenXML
+    except Exception:
+        return 0
+    if isinstance(xml, str):
+        xml = xml.encode("utf-8")
+    try:
+        root = ET.fromstring(xml)
+    except Exception:
+        return 0
+    table_el = root if root.tag == _w("tbl") else root.find(".//" + _w("tbl"))
+    if table_el is None:
+        return 0
+    count = 0
+    for row in table_el.findall(_w("tr")):
+        header = row.find("./" + _w("trPr") + "/" + _w("tblHeader"))
+        if header is None:
+            break
+        value = header.get(_w("val"))
+        if value in ("0", "false", "False"):
+            break
+        count += 1
+    return count
 
 
 def _has_enough_body_rows_before_break(row_index: int, header_count: int,
@@ -394,11 +508,15 @@ def _split_table_element(table, plan: _TableContinuationPlan, style_id: str) -> 
     if len(rows) < 2:
         return []
 
-    valid_breaks = _valid_continuation_breaks(plan.row_breaks, plan.header_count, len(rows))
+    valid_breaks = _valid_continuation_breaks(
+        _safe_vmerge_breaks(rows, plan.row_breaks),
+        plan.header_count,
+        len(rows),
+    )
     if not valid_breaks:
         return []
-    # 只应用当前分页测量得到的第一个断点。续表题会强制新页开始，
-    # 旧的后续断点在拆分后可能已经失效，需交给下一轮 Word 重新分页。
+    # 只应用当前分页测量得到的第一个断点。插入续表题和拆表后，
+    # 旧的后续断点可能已经失效，需交给下一轮 Word 重新分页。
     valid_breaks = valid_breaks[:1]
 
     start_rows = [1] + valid_breaks
@@ -430,21 +548,30 @@ def _valid_continuation_breaks(row_breaks: List[int], header_count: int,
             continue
         valid_breaks.append(br)
         previous_break = br
-    if valid_breaks and row_count - valid_breaks[-1] + 1 < _MIN_BODY_ROWS_BEFORE_CONTINUATION:
-        _rebalance_short_tail_break(valid_breaks, header_count, row_count)
     return valid_breaks
 
 
-def _rebalance_short_tail_break(valid_breaks: List[int], header_count: int, row_count: int):
-    last_break = valid_breaks[-1]
-    adjusted = row_count - _MIN_BODY_ROWS_BEFORE_CONTINUATION + 1
-    if adjusted >= last_break:
-        return
-    previous_break = valid_breaks[-2] if len(valid_breaks) > 1 else None
-    if _has_enough_body_rows_before_break(adjusted, header_count, previous_break):
-        valid_breaks[-1] = adjusted
-    else:
-        valid_breaks.pop()
+def _safe_vmerge_breaks(rows: List[ET.Element], row_breaks: List[int]) -> List[int]:
+    safe_breaks: List[int] = []
+    row_count = len(rows)
+    for br in row_breaks:
+        safe = br
+        while safe <= row_count and _row_has_vmerge_continue(rows[safe - 1]):
+            safe += 1
+        if safe <= row_count:
+            safe_breaks.append(safe)
+    return safe_breaks
+
+
+def _row_has_vmerge_continue(row: ET.Element) -> bool:
+    for cell in row.findall(_w("tc")):
+        vmerge = cell.find("./" + _w("tcPr") + "/" + _w("vMerge"))
+        if vmerge is None:
+            continue
+        value = vmerge.get(_w("val"))
+        if value in (None, "", "continue"):
+            return True
+    return False
 
 
 def _make_table_with_rows(source_table, rows: List[ET.Element]):
@@ -471,8 +598,8 @@ def _make_continuation_caption(source_table, text: str, style_id: str):
                 caption.remove(ppr)
                 ppr = copy.deepcopy(prev_ppr)
                 caption.append(ppr)
-    if ppr.find(_w("pageBreakBefore")) is None:
-        ET.SubElement(ppr, _w("pageBreakBefore"))
+    if ppr.find(_w("keepNext")) is None:
+        ET.SubElement(ppr, _w("keepNext"))
     run = ET.SubElement(caption, _w("r"))
     t = ET.SubElement(run, _w("t"))
     t.set("{%s}space" % _XML_NS, "preserve")
