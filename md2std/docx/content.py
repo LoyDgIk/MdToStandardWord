@@ -15,6 +15,7 @@ from docx.text.paragraph import Paragraph
 
 from .. import boilerplate as bp
 from .. import model
+from ..normative_refs import parse_implicit_ref_entry, parse_ref_registration
 from .. import styles as S
 from .oxml import *
 from .state import _needs_seq_reset, _next_bm_id
@@ -78,22 +79,22 @@ def _emit_introduction_content(anchor: Paragraph, doc, meta: model.Meta):
 
 
 _TERM_SPLIT_RE = re.compile(r"^(.*?)[\s　]{2,}(.+)$")
-# 规范性引用文件条目："标准号  标准名称"（标准号如 GB 5749 / GB/T 5750.3 / DZ/T 0225）
-_NORMREF_RE = re.compile(r"^\s*([A-Z][A-Z/]*\s+\d[\w.\-—–]*)(?:\s{2,}|　+)(.+)$")
 
 
 def _emit_normative_ref(anchor: Paragraph, doc, spans):
     """规范性引用文件条目：把标准号加书签，便于交叉引用插入"GB 5749"。"""
     text = "".join(s.text for s in spans).strip()
-    m = _NORMREF_RE.match(text)
-    if not m:
+    entry = parse_ref_registration(text)
+    if entry is None:
+        entry = parse_implicit_ref_entry(text)
+    if entry is None:
         _new_paragraph_before(anchor, doc, S.S_PARA, spans=spans)
         return
-    stdno, name = m.group(1).strip(), m.group(2).strip()
+    stdno, name = entry.code, entry.name
     para = _new_paragraph_before(anchor, doc, S.S_PARA)
     bid = _COUNTER.bm
     _COUNTER.bm += 1
-    _bookmark_start(para, _bm_name(stdno), bid)
+    _bookmark_start(para, _bm_name(entry.target), bid)
     para.add_run(stdno)
     _bookmark_end(para, bid)
     para.add_run("  " + name)

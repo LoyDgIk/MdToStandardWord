@@ -11,6 +11,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 
 from md2std import cli, docx_builder, md_parser, model, resources, word_postprocess
+from md2std.docx.oxml import _bm_name
 
 
 def _build_docx_xml(markdown: str) -> str:
@@ -108,6 +109,50 @@ class CrossReferenceParserTest(unittest.TestCase):
         self.assertEqual(ref.target, "classify")
         self.assertEqual(ref.mode, "label")
         self.assertEqual(table.anchor_id, "classify")
+
+    def test_standard_reference_registration_supports_aliases_and_foreign_years(self):
+        doc = md_parser.parse(
+            "# 范围\n\n"
+            "符合{{std:GB/T 1.1}}、{{std:JIS S 6006}}、"
+            "{{std:ISO 3160-2}}和{{std:EN 71—3:2019}}。\n\n"
+            "# 规范性引用文件\n\n"
+            "{{std:GB/T 1.1—2020}} GB/T 1.1—2020  标准化工作导则\n\n"
+            "{{std:JIS S 6006:2007}} JIS S 6006:2007  铅笔、彩色铅笔及其笔芯\n\n"
+            "{{std:ISO 3160-2:2015}} ISO 3160-2:2015  表壳体及其附件 金合金覆盖层 第2部分:纯度、厚度、耐腐蚀性能和附着力的测试\n\n"
+            "{{std:EN 71—3}} EN 71—3:2019  玩具安全 第3部分:特定元素的迁移\n"
+        )
+
+        scope = next(
+            blk for blk in doc.body
+            if isinstance(blk, model.Paragraph) and blk.text.startswith("符合")
+        )
+        refs = [
+            sp.target
+            for sp in scope.spans
+            if isinstance(sp, model.RefSpan) and sp.ref_type == "std"
+        ]
+        self.assertEqual(
+            ["GB/T 1.1—2020", "JIS S 6006:2007", "ISO 3160-2:2015", "EN 71—3"],
+            refs,
+        )
+
+    def test_implicit_normative_reference_warns_but_matches(self):
+        with self.assertWarnsRegex(UserWarning, "旧版自动识别"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "符合{{std:GB/T 11615}}。\n\n"
+                "# 规范性引用文件\n\n"
+                "GB/T 11615  地热资源地质勘查规范\n"
+            )
+
+    def test_domestic_standard_year_separator_warns_but_matches(self):
+        with self.assertWarnsRegex(UserWarning, "年份连接号"):
+            md_parser.parse(
+                "# 范围\n\n"
+                "符合{{std:GB/T 1.1—2020}}。\n\n"
+                "# 规范性引用文件\n\n"
+                "{{std:GB/T 1.1-2020}} GB/T 1.1-2020  标准化工作导则\n"
+            )
 
     def test_extended_markdown_subscript_and_superscript_render(self):
         doc = md_parser.parse("# 范围\n\nH~2~O 的 2^10^ 倍，T<sub>r</sub> 与 m<sup>3</sup>。\n")
@@ -768,6 +813,23 @@ class CrossReferenceParserTest(unittest.TestCase):
 
 class CrossReferenceDocxTest(unittest.TestCase):
     _W_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+    def test_normative_reference_registration_marker_is_not_emitted(self):
+        xml = _build_cover_docx_xml(
+            "---\n"
+            "title: 规范性引用测试\n"
+            "---\n\n"
+            "# 范围\n\n"
+            "应符合{{std:ISO 3160-2}}的规定。\n\n"
+            "# 规范性引用文件\n\n"
+            "{{std:ISO 3160-2:2015}} ISO 3160-2:2015  表壳体及其附件 金合金覆盖层 第2部分:纯度、厚度、耐腐蚀性能和附着力的测试\n"
+        )
+
+        self.assertNotIn("{{std:ISO 3160-2:2015}}", xml)
+        self.assertIn("ISO 3160-2:2015", xml)
+        bookmark = _bm_name("ISO 3160-2:2015")
+        self.assertIn('w:name="%s"' % bookmark, xml)
+        self.assertIn("REF %s" % bookmark, xml)
 
     def test_docx_uses_template_caption_numbering_styles(self):
         parts = _build_cover_docx_parts(
@@ -1476,7 +1538,7 @@ class CrossReferenceDocxTest(unittest.TestCase):
             "# 范围\n\n"
             "正文。\n\n"
             "# 规范性引用文件\n\n"
-            "GB/T 1.1  标准化工作导则\n\n"
+            "{{std:GB/T 1.1}} GB/T 1.1  标准化工作导则\n\n"
             "# 术语和定义\n\n"
             "## 地热资源  geothermal resources\n\n"
             "赋存于地球内部的热能资源。\n\n"
@@ -2385,6 +2447,12 @@ class CoverBackendDocxTest(unittest.TestCase):
         self.assertIsNotNone(continuation)
         self.assertIsNone(continuation.find("w:pPr/w:pageBreakBefore", self._W_NS))
         self.assertIsNotNone(continuation.find("w:pPr/w:keepNext", self._W_NS))
+        spacing = continuation.find("w:pPr/w:spacing", self._W_NS)
+        self.assertIsNotNone(spacing)
+        self.assertEqual(spacing.get(self._w_tag("before")), "50")
+        self.assertEqual(spacing.get(self._w_tag("after")), "50")
+        self.assertEqual(spacing.get(self._w_tag("line")), "400")
+        self.assertEqual(spacing.get(self._w_tag("lineRule")), "exact")
 
     def test_word_postprocess_applies_only_first_measured_break_per_iteration(self):
         sdoc = md_parser.parse(
@@ -2828,6 +2896,12 @@ class CoverBackendDocxTest(unittest.TestCase):
         continuation = self._et_paragraph_containing(root, "表1　测试表（续）")
         self.assertIsNone(continuation.find("w:pPr/w:pageBreakBefore", self._W_NS))
         self.assertIsNotNone(continuation.find("w:pPr/w:keepNext", self._W_NS))
+        spacing = continuation.find("w:pPr/w:spacing", self._W_NS)
+        self.assertIsNotNone(spacing)
+        self.assertEqual(spacing.get(self._w_tag("before")), "50")
+        self.assertEqual(spacing.get(self._w_tag("after")), "50")
+        self.assertEqual(spacing.get(self._w_tag("line")), "400")
+        self.assertEqual(spacing.get(self._w_tag("lineRule")), "exact")
         split_tables = [
             table for table in root.findall(".//w:tbl", self._W_NS)
             if "唯一表头" in self._et_text(table)

@@ -19,6 +19,13 @@ import yaml
 from markdown_it import MarkdownIt
 
 from . import model
+from .normative_refs import (
+    domestic_year_separator_issues,
+    normalize_standard_id,
+    parse_implicit_ref_entry,
+    parse_ref_registration,
+    standard_aliases,
+)
 
 # --------------------------------------------------------------------------- #
 # YAML front matter
@@ -62,10 +69,6 @@ _PAGE_BREAK_RE = re.compile(
     r"^\s*(?:<!--\s*(?:md2std:)?pagebreak\s*-->|\\pagebreak|\\newpage|\[pagebreak\])\s*$",
     re.I,
 )
-# 规范性引用文件条目："标准号  标准名称"。标准号允许不带年份。
-_NORMREF_RE = re.compile(r"^\s*([A-Z][A-Z/]*\s+\d[\w.\-—–]*)(?:\s{2,}|　+)(.+)$")
-
-
 def _pop_anchor(text):
     """从文本中取出首个 `{#type:id}`，返回 (去锚点文本, id)。"""
     m = _ANCHOR_RE.search(text)
@@ -117,7 +120,11 @@ def _parse_ref_token(token: str, bold: bool = False, italic: bool = False) -> mo
     if not m:
         raise ValueError("无效交叉引用语法：%s。" % token)
     raw = m.group(1).strip()
-    parts = [x.strip() for x in raw.split(":")]
+    if ":" in raw:
+        first, rest = raw.split(":", 1)
+        parts = [first.strip(), rest.strip()]
+    else:
+        parts = [raw.strip()]
     ref_type = parts[0] if parts else ""
     if ref_type not in _ALLOWED_REF_TYPES:
         raise ValueError("未知交叉引用类型：%s。支持 tbl、fig、eq、std。" % ref_type)
@@ -126,8 +133,9 @@ def _parse_ref_token(token: str, bold: bool = False, italic: bool = False) -> mo
             raise ValueError("规范性引用文件引用应写成 {{std:标准号}}。")
         return model.RefSpan(
             text=token, bold=bold, italic=italic,
-            ref_type=ref_type, target=parts[1], mode="num",
+            ref_type=ref_type, target=normalize_standard_id(parts[1]), mode="num",
         )
+    parts = [x.strip() for x in raw.split(":")]
     if len(parts) not in (2, 3) or not parts[1]:
         raise ValueError("图表公式引用应写成 {{%s:id}} 或 {{%s:id:label/full}}。" %
                          (ref_type, ref_type))
@@ -1860,8 +1868,18 @@ def _iter_block_spans(blk):
                         yield from part.spans
 
 
+def _warn_domestic_year_separator(text: str):
+    for code, sep in domestic_year_separator_issues(text):
+        warnings.warn(
+            "标准编号 `%s` 中年份连接号使用了 `%s`；国内标准年份连接符应使用 `—`。"
+            % (code, sep),
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def _collect_normative_refs(doc: model.StandardDoc):
-    refs = set()
+    refs: dict[str, str] = {}
     in_normrefs = False
     for blk in doc.body:
         if isinstance(blk, model.Heading) and blk.level == 1:
@@ -1869,9 +1887,23 @@ def _collect_normative_refs(doc: model.StandardDoc):
             continue
         if not in_normrefs or not isinstance(blk, model.Paragraph):
             continue
-        m = _NORMREF_RE.match(_spans_text(blk.spans).strip())
-        if m:
-            refs.add(m.group(1).strip())
+        text = _spans_text(blk.spans).strip()
+        _warn_domestic_year_separator(text)
+        entry = parse_ref_registration(text)
+        if entry is None:
+            entry = parse_implicit_ref_entry(text)
+            if entry is not None:
+                warnings.warn(
+                    "规范性引用文件条目 `%s` 使用了旧版自动识别；推荐改为行首 `{{std:%s}} %s` 注册。"
+                    % (entry.code, entry.target, entry.content),
+                    UserWarning,
+                    stacklevel=3,
+                )
+        if entry is None:
+            continue
+        canonical = normalize_standard_id(entry.target)
+        for alias in standard_aliases(entry.target, entry.code):
+            refs[alias] = canonical
     return refs
 
 
@@ -1905,9 +1937,13 @@ def _validate_refs(doc: model.StandardDoc):
             if not isinstance(sp, model.RefSpan):
                 continue
             if sp.ref_type == "std":
-                if sp.target not in normrefs:
+                _warn_domestic_year_separator(sp.target)
+                target = normalize_standard_id(sp.target)
+                canonical = normrefs.get(target)
+                if canonical is None:
                     raise ValueError("未知规范性引用文件：%s。请确认其已在“规范性引用文件”章中列出。" %
                                      sp.target)
+                sp.target = canonical
                 continue
             key = (sp.ref_type, sp.target)
             if key not in anchors:

@@ -32,6 +32,8 @@ _CAPTION_LOOKBACK_PARAGRAPHS = 6
 _HORIZONTAL_SPLIT_REPEAT_COLUMNS = 1
 _HORIZONTAL_SPLIT_MIN_COLUMNS = 4
 _HORIZONTAL_MIN_READABLE_COLUMN_WIDTH = 1000
+_CAPTION_SPACING_BEFORE_AFTER = 50
+_CAPTION_LINE_SPACING = 400
 
 
 @dataclass
@@ -978,11 +980,25 @@ def _make_continuation_caption(source_table, text: str, style_id: str):
                 caption.append(ppr)
     if ppr.find(_w("keepNext")) is None:
         ET.SubElement(ppr, _w("keepNext"))
+    _set_continuation_caption_spacing(ppr)
     run = ET.SubElement(caption, _w("r"))
     t = ET.SubElement(run, _w("t"))
     t.set("{%s}space" % _XML_NS, "preserve")
     t.text = text
     return caption
+
+
+def _set_continuation_caption_spacing(ppr):
+    spacing = ppr.find(_w("spacing"))
+    if spacing is None:
+        spacing = ET.SubElement(ppr, _w("spacing"))
+    spacing.set(_w("before"), str(_CAPTION_SPACING_BEFORE_AFTER))
+    spacing.set(_w("after"), str(_CAPTION_SPACING_BEFORE_AFTER))
+    spacing.set(_w("line"), str(_CAPTION_LINE_SPACING))
+    spacing.set(_w("lineRule"), "exact")
+    for attr in (_w("beforeLines"), _w("afterLines")):
+        if attr in spacing.attrib:
+            del spacing.attrib[attr]
 
 
 def _style_id_by_name(styles_xml: bytes, style_name: str) -> str:
